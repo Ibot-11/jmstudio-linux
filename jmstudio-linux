@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+# jmstudio-linux - run 3DMakerpro JMStudio (Moose, Fox, ...) on Linux via Proton or Wine.
+#
+# JMStudio is proprietary and needs a JMMeta account to download, so this script
+# never fetches it: you give `setup` the installer you downloaded yourself.
+set -euo pipefail
+
+VERSION="0.1.0"
+DOWNLOAD_PAGE="https://forum.jimumeta.com/home/help/download.html"
+
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+CONF_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+JM_HOME="${JMSTUDIO_HOME:-$DATA_HOME/jmstudio-linux}"
+PREFIX_DIR="$JM_HOME/prefix"        # Proton's STEAM_COMPAT_DATA_PATH; the Wine prefix is $PREFIX_DIR/pfx
+WINE_PREFIX_DIR="$JM_HOME/wineprefix" # plain-Wine runner only
+LOG_DIR="$JM_HOME/logs"
+STATE_FILE="$JM_HOME/state.env"
+USER_ENV="$CONF_HOME/jmstudio-linux/env"
+
+PROTON_NAME="${JMSTUDIO_PROTON:-Proton - Experimental}"
+RUNNER="${JMSTUDIO_RUNNER:-auto}"   # auto | slr | proton | wine
+DEBUG=0
+
+SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SCRIPT")"
+
+# USB IDs of the scanner's stereo cameras (see udev/70-3dmakerpro.rules)
+KNOWN_IDS=(0c45:636a 0c45:636b)
+
+# Filled in by resolve_runner
+PROTON_DIR="" SLR_ENTRY="" STEAM_ROOT="" EXE=""
+
+msg()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+	cat <<EOF
+jmstudio-linux $VERSION - run 3DMakerpro JMStudio on Linux
+
+Usage: jmstudio-linux [options] <command> [args]
+
+Commands:
+  setup [INSTALLER.exe]   create the prefix and run the JMStudio installer
+                          (--silent: unattended, --exe PATH: skip auto-detection)
+  run [args]              start JMStudio (default command)
+  doctor                  check Proton, USB access, GPU and the scanner
+  udev                    install the udev rules for the scanner (needs sudo)
+  desktop                 (re)create the application menu entry
+  set-exe PATH            tell the launcher where JMStudio.exe is
+  winecfg | regedit | cmd run the Wine tool inside the prefix
+  winetricks VERB...      run winetricks against the prefix (e.g. vcrun2022)
+  logs                    print the path of the newest Proton log
+  uninstall               remove the menu entry and (after asking) the prefix
+
+Options:
+  --debug                 write a Proton log to $LOG_DIR and enable USB/camera tracing
+  --proton NAME|DIR       Proton to use (default: "$PROTON_NAME"), e.g. GE-Proton11-7-x86_64
+  --runner R              auto | slr | proton | wine (default: auto)
+  -h, --help              this text
+
+Environment: JMSTUDIO_HOME, JMSTUDIO_PROTON, JMSTUDIO_RUNNER.
+Extra environment variables for JMStudio go in $USER_ENV (one 'export FOO=bar' per line).
+EOF
+}
+
+# ---------------------------------------------------------------- discovery
+
+steam_roots() {
+	local r seen=""
+	for r in "$DATA_HOME/Steam" "$HOME/.steam/steam" "$HOME/.steam/root" \
+	         "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"; do
+		[[ -d $r/steamapps ]] || continue
+		r="$(readlink -f "$r")"
+		[[ $seen == *"|$r|"* ]] && continue
+		seen+="|$r|"
+		echo "$r"
+	done
+}
+
+# Every Steam library folder, including the roots themselves.
+steam_libraries() {
+	local root vdf
+	while IFS= read -r root; do
+		echo "$root"
+		vdf="$root/steamapps/libraryfolders.vdf"
+		[[ -f $vdf ]] && sed -n 's/^[[:space:]]*"path"[[:space:]]*"\(.*\)"/\1/p' "$vdf"
+	done < <(steam_roots) | awk '!seen[$0]++'
+}
+
+find_proton() {
+	local name="$PROTON_NAME" lib root d
+	if [[ -x $name/proton ]]; then readlink -f "$name"; return 0; fi
+	while IFS= read -r lib; do
+		d="$lib/steamapps/common/$name"
+		[[ -x $d/proton ]] && { readlink -f "$d"; return 0; }
+	done < <(steam_libraries)
+	while IFS= read -r root; do
+		d="$root/compatibilitytools.d/$name"
+		[[ -x $d/proton ]] && { readlink -f "$d"; return 0; }
+	done < <(steam_roots)
+	d="/usr/share/steam/compatibility-tools.d/$name"
+	[[ -x $d/proton ]] && { readlink -f "$d"; return 0; }
+	return 1
+}
+
+# The container runtime a Proton build asks for (toolmanifest require_tool_appid).
+find_slr_entry() {
+	local proton="$1" appid lib acf dir
+	appid="$(sed -n 's/.*"require_tool_appid"[[:space:]]*"\([0-9]*\)".*/\1/p' "$proton/toolmanifest.vdf" 2>/dev/null | head -1)"
+	[[ -n $appid ]] || return 1
+	while IFS= read -r lib; do
+		acf="$lib/steamapps/appmanifest_$appid.acf"
+		[[ -f $acf ]] || continue
+		dir="$(sed -n 's/.*"installdir"[[:space:]]*"\(.*\)".*/\1/p' "$acf" | head -1)"
+		[[ -x $lib/steamapps/common/$dir/_v2-entry-point ]] && { echo "$lib/steamapps/common/$dir/_v2-entry-point"; return 0; }
+	done < <(steam_libraries)
+	return 1
+}
+
+resolve_runner() {
+	if [[ $RUNNER == wine ]]; then
+		command -v wine >/dev/null || die "runner 'wine' selected but wine is not installed"
+		return
+	fi
+	PROTON_DIR="$(find_proton)" || {
+		[[ $RUNNER == auto ]] && command -v wine >/dev/null && {
+			warn "'$PROTON_NAME' not found, falling back to system Wine"; RUNNER=wine; return; }
+		die "'$PROTON_NAME' not found. Install it in Steam (Library > Tools > Proton Experimental) or pass --proton."
+	}
+	STEAM_ROOT="$(steam_roots | head -1)"
+	[[ -n $STEAM_ROOT ]] || die "no Steam installation found (Proton needs STEAM_COMPAT_CLIENT_INSTALL_PATH)"
+	if [[ $RUNNER == auto || $RUNNER == slr ]]; then
+		if SLR_ENTRY="$(find_slr_entry "$PROTON_DIR")"; then RUNNER=slr
+		elif [[ $RUNNER == slr ]]; then die "Steam Linux Runtime for $PROTON_NAME not installed (start Steam once with that Proton)"
+		else warn "Steam Linux Runtime not found, running Proton without its container"; RUNNER=proton
+		fi
+	fi
+}
+
+proton_wine_bin() {
+	local p
+	for p in files/bin/wine64 files/bin/wine dist/bin/wine64 dist/bin/wine; do
+		[[ -x $PROTON_DIR/$p ]] && { echo "$PROTON_DIR/$p"; return 0; }
+	done
+	return 1
+}
+
+wine_prefix() { [[ $RUNNER == wine ]] && echo "$WINE_PREFIX_DIR" || echo "$PREFIX_DIR/pfx"; }
+
+# ---------------------------------------------------------------- execution
+
+# Run a Windows command inside the prefix with the selected runner.
+run_in_prefix() {
+	mkdir -p "$PREFIX_DIR" "$LOG_DIR"
+	# shellcheck disable=SC1090
+	[[ -f $USER_ENV ]] && source "$USER_ENV"
+	# Proton only writes a log when SteamGameId is set; the id itself is arbitrary here
+	export SteamGameId="${SteamGameId:-jmstudio}"
+	if (( DEBUG )); then
+		export PROTON_LOG=1 PROTON_LOG_DIR="$LOG_DIR"
+		export WINEDEBUG="${WINEDEBUG:-+timestamp,+usb,+qcap,+dshow,+mfplat,err+all}"
+		msg "debug log: $LOG_DIR/steam-$SteamGameId.log - WINEDEBUG=$WINEDEBUG"
+	fi
+	case $RUNNER in
+		slr)
+			# the container only sees $HOME and the prefix by default; JM_HOME may live elsewhere
+			PRESSURE_VESSEL_FILESYSTEMS_RW="$JM_HOME${PRESSURE_VESSEL_FILESYSTEMS_RW:+:$PRESSURE_VESSEL_FILESYSTEMS_RW}" \
+			STEAM_COMPAT_DATA_PATH="$PREFIX_DIR" STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" \
+				"$SLR_ENTRY" --verb=waitforexitandrun -- "$PROTON_DIR/proton" waitforexitandrun "$@" ;;
+		proton)
+			STEAM_COMPAT_DATA_PATH="$PREFIX_DIR" STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" \
+				"$PROTON_DIR/proton" waitforexitandrun "$@" ;;
+		wine)
+			mkdir -p "$WINE_PREFIX_DIR"
+			WINEPREFIX="$WINE_PREFIX_DIR" WINEDEBUG="${WINEDEBUG:--all}" wine "$@" ;;
+	esac
+}
+
+load_state() {
+	# shellcheck disable=SC1090
+	[[ -f $STATE_FILE ]] && source "$STATE_FILE"
+	EXE="${JMSTUDIO_EXE:-}"
+}
+
+save_exe() {
+	mkdir -p "$JM_HOME"
+	printf 'JMSTUDIO_EXE=%q\n' "$1" > "$STATE_FILE"
+	EXE="$1"
+}
+
+# JMStudio.exe inside the prefix; skip uninstallers, redistributables and crash helpers.
+find_exe() {
+	local root="$1" f best=""
+	local -a hits=()
+	while IFS= read -r -d '' f; do hits+=("$f"); done < <(
+		find "$root/drive_c" -type f -iname '*jmstudio*.exe' \
+			! -iname 'unins*' ! -iname '*setup*' ! -iname '*crash*' ! -iname '*update*' -print0 2>/dev/null)
+	for f in "${hits[@]}"; do
+		[[ ${f##*/} == [Jj][Mm][Ss]tudio.exe ]] && best="$f"
+	done
+	[[ -z $best && ${#hits[@]} -eq 1 ]] && best="${hits[0]}"
+	if [[ -n $best ]]; then echo "$best"; return 0; fi
+	(( ${#hits[@]} )) && printf '  candidate: %s\n' "${hits[@]}" >&2
+	return 1
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_setup() {
+	local installer="" silent=0 exe_arg=""
+	while (( $# )); do
+		case $1 in
+			--silent) silent=1 ;;
+			--exe) exe_arg="${2:?--exe needs a path}"; shift ;;
+			*) installer="$1" ;;
+		esac
+		shift
+	done
+	resolve_runner
+
+	if [[ -z $installer ]]; then
+		installer="$(find "$HOME/Downloads" "$HOME/Desktop" "$PWD" -maxdepth 2 -type f \
+			-iname 'JMStudioSetup*.exe' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)"
+	fi
+	if [[ -z $installer || ! -f $installer ]]; then
+		cat >&2 <<EOF
+No JMStudio installer found.
+
+Download "JMStudio > Windows" from
+  $DOWNLOAD_PAGE
+(a free JMMeta account is required), then run:
+  jmstudio-linux setup ~/Downloads/JMStudioSetup-*.exe
+EOF
+		exit 1
+	fi
+
+	msg "runner: $RUNNER${PROTON_DIR:+, $(basename "$PROTON_DIR") ($(tr -d '\n' < "$PROTON_DIR/version" 2>/dev/null))}"
+	msg "installer: $installer"
+	msg "sha256: $(sha256sum "$installer" | cut -d' ' -f1)"
+
+	local -a flags=()
+	if (( silent )); then
+		if grep -qa 'Inno Setup' "$installer"; then flags=(/VERYSILENT /SUPPRESSMSGBOXES /NORESTART)
+		elif grep -qa 'Nullsoft' "$installer"; then flags=(/S)
+		else warn "unknown installer type, ignoring --silent"; fi
+	fi
+	msg "running the installer (this also creates the prefix on first use)..."
+	run_in_prefix "$installer" "${flags[@]}" || warn "installer exited with an error, checking for an installation anyway"
+
+	if [[ -n $exe_arg ]]; then
+		save_exe "$exe_arg"
+	elif EXE="$(find_exe "$(wine_prefix)")"; then
+		save_exe "$EXE"
+	else
+		die "installation finished but JMStudio.exe was not found. Locate it and run: jmstudio-linux set-exe PATH"
+	fi
+	msg "JMStudio: $EXE"
+	cmd_desktop
+	cat <<EOF
+
+Done. Next steps:
+  1. $SCRIPT udev             # one-time USB permissions for the scanner (asks for sudo)
+  2. replug the scanner, then: $SCRIPT doctor
+  3. $SCRIPT run
+EOF
+}
+
+cmd_run() {
+	load_state
+	[[ -n $EXE && -f $EXE ]] || die "JMStudio is not set up yet. Run: jmstudio-linux setup (see --help)"
+	resolve_runner
+	cd "$(dirname "$EXE")"
+	run_in_prefix "$EXE" "$@"
+}
+
+cmd_desktop() {
+	load_state
+	local dir="$DATA_HOME/applications"
+	mkdir -p "$dir"
+	cat > "$dir/jmstudio-linux.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=JMStudio (3DMakerpro)
+Comment=3D scanner software for the Moose, run through Proton
+Exec="$SCRIPT" run
+Icon=applications-graphics
+Categories=Graphics;3DGraphics;
+Terminal=false
+StartupNotify=true
+EOF
+	msg "menu entry: $dir/jmstudio-linux.desktop"
+}
+
+cmd_set_exe() {
+	local p="${1:?usage: jmstudio-linux set-exe PATH}"
+	[[ -f $p ]] || die "no such file: $p"
+	save_exe "$(readlink -f "$p")"
+	msg "JMStudio: $EXE"
+}
+
+cmd_udev() {
+	local rules="$SCRIPT_DIR/udev/70-3dmakerpro.rules" dest="/etc/udev/rules.d/70-3dmakerpro.rules"
+	[[ -f $rules ]] || die "rules file missing: $rules"
+	msg "installing $dest (sudo)"
+	sudo install -m 644 "$rules" "$dest"
+	sudo udevadm control --reload-rules
+	sudo udevadm trigger --subsystem-match=usb --action=add
+	msg "done - replug the scanner"
+}
+
+cmd_tool() {
+	resolve_runner
+	run_in_prefix "$@"
+}
+
+cmd_winetricks() {
+	command -v winetricks >/dev/null || die "winetricks is not installed"
+	resolve_runner
+	if [[ $RUNNER == wine ]]; then
+		WINEPREFIX="$WINE_PREFIX_DIR" winetricks "$@"
+	else
+		local wine; wine="$(proton_wine_bin)" || die "no wine binary in $PROTON_DIR"
+		WINEPREFIX="$PREFIX_DIR/pfx" WINE="$wine" WINESERVER="$(dirname "$wine")/wineserver" winetricks "$@"
+	fi
+}
+
+cmd_logs() {
+	local f; f="$(ls -t "$LOG_DIR"/*.log 2>/dev/null | head -1)"
+	[[ -n $f ]] && echo "$f" || die "no logs yet - start with: jmstudio-linux --debug run"
+}
+
+cmd_uninstall() {
+	rm -f "$DATA_HOME/applications/jmstudio-linux.desktop"
+	msg "menu entry removed"
+	[[ -d $JM_HOME && $JM_HOME != / && $JM_HOME != "$HOME" ]] || return 0
+	local a; read -r -p "Delete $JM_HOME (prefix, logs, installed JMStudio)? [y/N] " a
+	[[ $a == [yY]* ]] && rm -rf -- "$JM_HOME" && msg "deleted $JM_HOME"
+	return 0
+}
+
+cmd_doctor() {
+	local ok=0 bad=0
+	pass() { printf '  \033[32mok\033[0m    %s\n' "$*"; ok=$((ok+1)); }
+	fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; bad=$((bad+1)); }
+	note() { printf '  \033[33m..\033[0m    %s\n' "$*"; }
+
+	echo "Runner"
+	if (resolve_runner) 2>/dev/null; then
+		resolve_runner
+		pass "runner: $RUNNER${PROTON_DIR:+ / $PROTON_DIR}"
+		[[ -n $PROTON_DIR ]] && note "version: $(tr -d '\n' < "$PROTON_DIR/version" 2>/dev/null)"
+		[[ -n $SLR_ENTRY ]] && pass "container runtime: $SLR_ENTRY"
+	else
+		fail "no usable Proton/Wine found (see --help)"
+	fi
+	[[ -e /dev/ntsync ]] && pass "/dev/ntsync present (fast sync)" || note "no /dev/ntsync (kernel < 6.14 or module not loaded) - works, just slower"
+
+	echo "JMStudio"
+	load_state
+	if [[ -n $EXE && -f $EXE ]]; then pass "installed: $EXE"; else fail "not set up - run: jmstudio-linux setup"; fi
+
+	echo "Scanner (USB)"
+	local id found=0 line bus dev node
+	for id in "${KNOWN_IDS[@]}"; do
+		line="$(lsusb -d "$id" 2>/dev/null | head -1)" || true
+		[[ -n $line ]] || continue
+		found=1
+		bus="$(awk '{print $2}' <<<"$line")"; dev="$(awk '{print $4}' <<<"$line")"; dev="${dev%:}"
+		node="/dev/bus/usb/$bus/$dev"
+		if [[ -r $node && -w $node ]]; then pass "$id accessible ($node)"
+		else fail "$id found but $node is not accessible - run: $SCRIPT udev, then replug"; fi
+	done
+	if (( ! found )); then
+		fail "scanner not found (looked for ${KNOWN_IDS[*]}). Plugged in? Try another USB 2.0 port without a hub."
+		note "other cameras: $(lsusb | grep -iE 'kyt|jimu|3dmaker|0c45' | tr '\n' ';' || true)"
+	fi
+	[[ -f /etc/udev/rules.d/70-3dmakerpro.rules ]] && pass "udev rules installed" || note "udev rules not installed ($SCRIPT udev)"
+	if compgen -G '/sys/class/video4linux/video*' >/dev/null; then
+		local v; for v in /sys/class/video4linux/video*; do note "${v##*/}: $(cat "$v/name" 2>/dev/null)"; done
+	fi
+	id -nG | tr ' ' '\n' | grep -qx video && pass "user is in group 'video'" || note "user not in group 'video' (cameras may need it)"
+
+	echo "Graphics"
+	if command -v vulkaninfo >/dev/null; then
+		vulkaninfo --summary 2>/dev/null | sed -n 's/^[[:space:]]*deviceName[[:space:]]*=[[:space:]]*/  ok    GPU: /p' | sort -u
+	else
+		note "vulkaninfo not installed - cannot list GPUs"
+	fi
+	echo; echo "$ok ok, $bad problem(s)"
+	(( bad == 0 ))
+}
+
+# ---------------------------------------------------------------- main
+
+while (( $# )); do
+	case $1 in
+		--debug) DEBUG=1 ;;
+		--proton) PROTON_NAME="${2:?--proton needs a value}"; shift ;;
+		--runner) RUNNER="${2:?--runner needs a value}"; shift ;;
+		-h|--help) usage; exit 0 ;;
+		*) break ;;
+	esac
+	shift
+done
+
+cmd="${1:-run}"; (( $# )) && shift
+case $cmd in
+	setup|install) cmd_setup "$@" ;;
+	run)           cmd_run "$@" ;;
+	doctor)        cmd_doctor ;;
+	udev)          cmd_udev ;;
+	desktop)       cmd_desktop ;;
+	set-exe)       cmd_set_exe "$@" ;;
+	winecfg|regedit|cmd) cmd_tool "$cmd" "$@" ;;
+	winetricks)    cmd_winetricks "$@" ;;
+	logs)          cmd_logs ;;
+	uninstall)     cmd_uninstall ;;
+	help)          usage ;;
+	*)             usage >&2; exit 2 ;;
+esac
