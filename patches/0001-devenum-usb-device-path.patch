@@ -1,0 +1,127 @@
+--- a/dlls/devenum/createdevenum.c
++++ b/dlls/devenum/createdevenum.c
+@@ -711,9 +711,113 @@
+     }
+ }
+ 
++/* Applications identify USB cameras by the DevicePath that Windows reports,
++ *   \\?\usb#vid_xxxx&pid_xxxx[&mi_xx]#<instance>#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global
++ * which carries the vendor and product ID. A v4l2 node has none of that, so find
++ * the USB device that owns /dev/videoN in sysfs and build the same string. */
++#define SYSFS_USB_DEVICES L"Z:\\sys\\bus\\usb\\devices"
++
++static BOOL read_sysfs_attr(const WCHAR *dir, const WCHAR *name, char *buf, DWORD size)
++{
++    WCHAR path[MAX_PATH];
++    DWORD len = 0;
++    HANDLE file;
++
++    swprintf(path, ARRAY_SIZE(path), L"%ls\\%ls", dir, name);
++    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
++    if (file == INVALID_HANDLE_VALUE) return FALSE;
++    if (!ReadFile(file, buf, size - 1, &len, NULL)) len = 0;
++    CloseHandle(file);
++
++    while (len && (buf[len - 1] == '\n' || buf[len - 1] == ' ')) len--;
++    buf[len] = 0;
++    return len != 0;
++}
++
++/* Find the USB device and interface directory in sysfs that provide /dev/video<index>. */
++static BOOL find_usb_video_device(unsigned int index, WCHAR *dev_dir, WCHAR *dev_name, WCHAR *if_name)
++{
++    WCHAR pattern[MAX_PATH], path[MAX_PATH];
++    WIN32_FIND_DATAW dev_data, if_data;
++    HANDLE dev_find, if_find;
++    BOOL found = FALSE;
++
++    dev_find = FindFirstFileW(SYSFS_USB_DEVICES L"\\*", &dev_data);
++    if (dev_find == INVALID_HANDLE_VALUE) return FALSE;
++
++    do
++    {
++        /* interfaces are listed here too, as "<device>:<config>.<interface>" */
++        if (dev_data.cFileName[0] == '.' || wcschr(dev_data.cFileName, ':')) continue;
++
++        swprintf(dev_dir, MAX_PATH, SYSFS_USB_DEVICES L"\\%ls", dev_data.cFileName);
++        swprintf(pattern, ARRAY_SIZE(pattern), L"%ls\\%ls:*", dev_dir, dev_data.cFileName);
++        if ((if_find = FindFirstFileW(pattern, &if_data)) == INVALID_HANDLE_VALUE) continue;
++
++        do
++        {
++            swprintf(path, ARRAY_SIZE(path), L"%ls\\%ls\\video4linux\\video%u", dev_dir, if_data.cFileName, index);
++            if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
++            {
++                lstrcpyW(dev_name, dev_data.cFileName);
++                lstrcpyW(if_name, if_data.cFileName);
++                found = TRUE;
++            }
++        } while (!found && FindNextFileW(if_find, &if_data));
++        FindClose(if_find);
++    } while (!found && FindNextFileW(dev_find, &dev_data));
++
++    FindClose(dev_find);
++    return found;
++}
++
++static BOOL get_usb_device_path(unsigned int index, WCHAR *device_path, size_t len)
++{
++    WCHAR dev_dir[MAX_PATH], dev_name[MAX_PATH], if_name[MAX_PATH], if_dir[MAX_PATH];
++    char vid[8], pid[8], serial[64] = "", cls[8], subcls[8], proto[8], iface[8];
++    BOOL composite;
++    UINT32 hash = 2166136261u;
++    const char *p;
++    const WCHAR *w;
++
++    if (!find_usb_video_device(index, dev_dir, dev_name, if_name)) return FALSE;
++
++    swprintf(if_dir, ARRAY_SIZE(if_dir), L"%ls\\%ls", dev_dir, if_name);
++    if (!read_sysfs_attr(dev_dir, L"idVendor", vid, sizeof(vid)) ||
++        !read_sysfs_attr(dev_dir, L"idProduct", pid, sizeof(pid)) ||
++        !read_sysfs_attr(if_dir, L"bInterfaceNumber", iface, sizeof(iface)))
++        return FALSE;
++    read_sysfs_attr(dev_dir, L"serial", serial, sizeof(serial));
++
++    /* Windows puts a device with an interface association descriptor (or several
++     * interfaces and no class) behind usbccgp, which adds "&mi_xx" to the path. */
++    composite = FALSE;
++    if (read_sysfs_attr(dev_dir, L"bDeviceClass", cls, sizeof(cls)) &&
++        read_sysfs_attr(dev_dir, L"bDeviceSubClass", subcls, sizeof(subcls)) &&
++        read_sysfs_attr(dev_dir, L"bDeviceProtocol", proto, sizeof(proto)))
++        composite = !strcmp(cls, "ef") && !strcmp(subcls, "02") && !strcmp(proto, "01");
++
++    /* the instance id is an opaque hash on Windows; derive a stable one from the port path and serial */
++    for (w = dev_name; *w; w++) hash = (hash ^ *w) * 16777619u;
++    for (p = serial; *p; p++) hash = (hash ^ (UINT8)*p) * 16777619u;
++
++    if (composite)
++        swprintf(device_path, len, L"\\\\?\\usb#vid_%hs&pid_%hs&mi_%hs#6&%08x&0&%04x#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
++                vid, pid, iface, hash, (unsigned int)strtoul(iface, NULL, 16));
++    else if (serial[0])
++        swprintf(device_path, len, L"\\\\?\\usb#vid_%hs&pid_%hs#%hs#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
++                vid, pid, serial);
++    else
++        swprintf(device_path, len, L"\\\\?\\usb#vid_%hs&pid_%hs#6&%08x&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
++                vid, pid, hash);
++
++    TRACE("video%u -> %s\n", index, debugstr_w(device_path));
++    return TRUE;
++}
++
+ static void register_avicap_devices(void)
+ {
+-    WCHAR friendlyname[32], version[32], device_path[32];
++    WCHAR friendlyname[32], version[32], device_path[MAX_PATH];
+     IPropertyBag *prop_bag = NULL;
+     REGFILTERPINS2 rgpins = {0};
+     REGPINTYPES rgtypes;
+@@ -753,7 +857,8 @@
+         V_I4(&var) = i;
+         IPropertyBag_Write(prop_bag, L"VFWIndex", &var);
+ 
+-        swprintf(device_path, ARRAY_SIZE(device_path), L"dummy_video%d", i);
++        if (!get_usb_device_path(i, device_path, ARRAY_SIZE(device_path)))
++            swprintf(device_path, ARRAY_SIZE(device_path), L"dummy_video%d", i);
+         V_VT(&var) = VT_BSTR;
+         V_BSTR(&var) = SysAllocString(device_path);
+         IPropertyBag_Write(prop_bag, L"DevicePath", &var);

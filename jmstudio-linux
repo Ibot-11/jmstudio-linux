@@ -16,6 +16,7 @@ WINE_PREFIX_DIR="$JM_HOME/wineprefix" # plain-Wine runner only
 LOG_DIR="$JM_HOME/logs"
 STATE_FILE="$JM_HOME/state.env"
 USER_ENV="$CONF_HOME/jmstudio-linux/env"
+CAMERAFIX_DIR="$JM_HOME/camerafix"  # patched Wine DLLs built by patches/build.sh
 
 PROTON_NAME="${JMSTUDIO_PROTON:-Proton - Experimental}"
 RUNNER="${JMSTUDIO_RUNNER:-auto}"   # auto | slr | proton | wine
@@ -46,7 +47,9 @@ Commands:
                           (--silent: unattended, --exe PATH: skip auto-detection)
   run [args]              start JMStudio (default command)
   doctor                  check Proton, USB access, GPU and the scanner
-  udev                    install the udev rules for the scanner (needs sudo)
+  udev                    install the udev rules for the scanner (asks for your password)
+  camerafix [ACTION]      patched Wine DLLs so JMStudio can find the scanner, ACTION =
+                          build | install (default) | remove | status
   desktop                 (re)create the application menu entry
   set-exe PATH            tell the launcher where JMStudio.exe is
   winecfg | regedit | cmd run the Wine tool inside the prefix
@@ -261,9 +264,10 @@ EOF
 	cat <<EOF
 
 Done. Next steps:
-  1. $SCRIPT udev             # one-time USB permissions for the scanner (asks for sudo)
-  2. replug the scanner, then: $SCRIPT doctor
-  3. $SCRIPT run
+  1. $SCRIPT udev             # one-time USB permissions for the scanner (asks for your password)
+  2. $SCRIPT camerafix        # patched Wine DLLs so JMStudio can find the scanner (builds them)
+  3. $SCRIPT doctor
+  4. $SCRIPT run
 EOF
 }
 
@@ -316,6 +320,69 @@ cmd_udev() {
 	msg "done - replug the scanner"
 }
 
+# Wine alone cannot show the scanner to JMStudio (see patches/): DirectShow reports no USB
+# vendor/product ID for cameras (devenum.dll), and Media Foundation lists no cameras at all
+# (mf.dll). The camera fix puts patched builds of both into this prefix. They replace the
+# prefix's copies (symlinks into Proton), so Proton itself stays untouched.
+CAMERAFIX_DLLS=(devenum mf)
+
+camerafix_target() { echo "$(wine_prefix)/drive_c/windows/system32/$1.dll"; }
+
+# True when every patched DLL is in the prefix (a regular file, original kept beside it).
+camerafix_installed() {
+	local d t
+	for d in "${CAMERAFIX_DLLS[@]}"; do
+		t="$(camerafix_target "$d")"
+		[[ -f $t && ! -L $t && ( -e $t.orig || -L $t.orig ) ]] || return 1
+	done
+}
+
+camerafix_install() {
+	local d t
+	for d in "${CAMERAFIX_DLLS[@]}"; do
+		if [[ ! -f $CAMERAFIX_DIR/$d.dll ]]; then
+			msg "building the patched DLLs"
+			"$SCRIPT_DIR/patches/build.sh" "$CAMERAFIX_DIR"
+			break
+		fi
+	done
+	for d in "${CAMERAFIX_DLLS[@]}"; do
+		t="$(camerafix_target "$d")"
+		[[ -e $t || -L $t ]] || die "no prefix yet - run: jmstudio-linux setup"
+		[[ -e $t.orig || -L $t.orig ]] || mv "$t" "$t.orig"
+		cp --remove-destination "$CAMERAFIX_DIR/$d.dll" "$t"
+		# Wine swaps files that carry its "builtin" marker for its own copy; blank the marker
+		# so the prefix file is treated as a native DLL and loaded instead.
+		head -c 16 /dev/zero | dd of="$t" bs=1 seek=64 conv=notrunc status=none
+		run_in_prefix reg add 'HKCU\Software\Wine\DllOverrides' /v "$d" /d 'native,builtin' /f
+	done
+	msg "camera fix installed - restart JMStudio"
+}
+
+camerafix_remove() {
+	local d t
+	for d in "${CAMERAFIX_DLLS[@]}"; do
+		t="$(camerafix_target "$d")"
+		run_in_prefix reg delete 'HKCU\Software\Wine\DllOverrides' /v "$d" /f || true
+		if [[ -e $t.orig || -L $t.orig ]]; then
+			rm -f "$t"
+			mv "$t.orig" "$t"
+		fi
+	done
+	msg "original Wine DLLs restored"
+}
+
+cmd_camerafix() {
+	local action="${1:-install}"
+	case $action in
+		build)   "$SCRIPT_DIR/patches/build.sh" "$CAMERAFIX_DIR" ;;
+		install) resolve_runner; camerafix_install ;;
+		remove)  resolve_runner; camerafix_remove ;;
+		status)  resolve_runner; camerafix_installed && echo "installed" || { echo "not installed"; return 1; } ;;
+		*)       die "usage: jmstudio-linux camerafix [build|install|remove|status]" ;;
+	esac
+}
+
 cmd_tool() {
 	resolve_runner
 	run_in_prefix "$@"
@@ -366,6 +433,8 @@ cmd_doctor() {
 	echo "JMStudio"
 	load_state
 	if [[ -n $EXE && -f $EXE ]]; then pass "installed: $EXE"; else fail "not set up - run: jmstudio-linux setup"; fi
+	if camerafix_installed; then pass "camera fix (patched devenum.dll and mf.dll) installed"
+	else fail "camera fix missing - JMStudio cannot find the scanner. Run: $SCRIPT camerafix"; fi
 
 	echo "Scanner (USB)"
 	local id found=0 line bus dev node name
@@ -419,6 +488,7 @@ case $cmd in
 	run)           cmd_run "$@" ;;
 	doctor)        cmd_doctor ;;
 	udev)          cmd_udev ;;
+	camerafix)     cmd_camerafix "$@" ;;
 	desktop)       cmd_desktop ;;
 	set-exe)       cmd_set_exe "$@" ;;
 	winecfg|regedit|cmd) cmd_tool "$cmd" "$@" ;;

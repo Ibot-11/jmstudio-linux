@@ -1,0 +1,302 @@
+--- a/dlls/mf/Makefile.in
++++ b/dlls/mf/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE    = mf.dll
+ IMPORTLIB = mf
+-IMPORTS   = advapi32 mfplat ole32 uuid mfuuid strmiids
++IMPORTS   = advapi32 mfplat ole32 oleaut32 uuid mfuuid strmiids
+ DELAYIMPORTS = evr urlmon user32
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+--- a/dlls/mf/main.c
++++ b/dlls/mf/main.c
+@@ -24,6 +24,7 @@
+ #include "windef.h"
+ #include "winbase.h"
+ #include "mfidl.h"
++#include "dshow.h"
+ #include "rpcproxy.h"
+ 
+ #include "mf_private.h"
+@@ -744,6 +745,268 @@
+     return S_OK;
+ }
+ 
++/* Video capture is only enumerated, not captured: applications (Qt for one) list cameras
++ * through MFEnumDeviceSources and read their name and symbolic link. Activating a device
++ * gives a source that refuses every request, so callers fail cleanly instead of crashing. */
++struct video_capture_source
++{
++    IMFMediaSource IMFMediaSource_iface;
++    LONG refcount;
++};
++
++static struct video_capture_source *impl_from_video_capture_source(IMFMediaSource *iface)
++{
++    return CONTAINING_RECORD(iface, struct video_capture_source, IMFMediaSource_iface);
++}
++
++static HRESULT WINAPI video_capture_source_QueryInterface(IMFMediaSource *iface, REFIID riid, void **obj)
++{
++    TRACE("%p, %s, %p.\n", iface, debugstr_guid(riid), obj);
++
++    if (IsEqualIID(riid, &IID_IMFMediaSource) ||
++            IsEqualIID(riid, &IID_IMFMediaEventGenerator) ||
++            IsEqualIID(riid, &IID_IUnknown))
++    {
++        *obj = iface;
++        IMFMediaSource_AddRef(iface);
++        return S_OK;
++    }
++
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI video_capture_source_AddRef(IMFMediaSource *iface)
++{
++    struct video_capture_source *source = impl_from_video_capture_source(iface);
++    ULONG refcount = InterlockedIncrement(&source->refcount);
++
++    TRACE("%p, refcount %lu.\n", iface, refcount);
++
++    return refcount;
++}
++
++static ULONG WINAPI video_capture_source_Release(IMFMediaSource *iface)
++{
++    struct video_capture_source *source = impl_from_video_capture_source(iface);
++    ULONG refcount = InterlockedDecrement(&source->refcount);
++
++    TRACE("%p, refcount %lu.\n", iface, refcount);
++
++    if (!refcount)
++        free(source);
++
++    return refcount;
++}
++
++static HRESULT WINAPI video_capture_source_GetEvent(IMFMediaSource *iface, DWORD flags, IMFMediaEvent **event)
++{
++    return MF_E_SHUTDOWN;
++}
++
++static HRESULT WINAPI video_capture_source_BeginGetEvent(IMFMediaSource *iface, IMFAsyncCallback *callback,
++        IUnknown *state)
++{
++    return MF_E_SHUTDOWN;
++}
++
++static HRESULT WINAPI video_capture_source_EndGetEvent(IMFMediaSource *iface, IMFAsyncResult *result,
++        IMFMediaEvent **event)
++{
++    return MF_E_SHUTDOWN;
++}
++
++static HRESULT WINAPI video_capture_source_QueueEvent(IMFMediaSource *iface, MediaEventType event_type,
++        REFGUID ext_type, HRESULT hr, const PROPVARIANT *value)
++{
++    return MF_E_SHUTDOWN;
++}
++
++static HRESULT WINAPI video_capture_source_GetCharacteristics(IMFMediaSource *iface, DWORD *characteristics)
++{
++    return MF_E_SHUTDOWN;
++}
++
++static HRESULT WINAPI video_capture_source_CreatePresentationDescriptor(IMFMediaSource *iface,
++        IMFPresentationDescriptor **descriptor)
++{
++    static LONG warned;
++
++    if (!InterlockedExchange(&warned, 1))
++        FIXME("%p, %p: video capture is not implemented.\n", iface, descriptor);
++
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI video_capture_source_Start(IMFMediaSource *iface, IMFPresentationDescriptor *descriptor,
++        const GUID *time_format, const PROPVARIANT *start_position)
++{
++    return MF_E_SHUTDOWN;
++}
++
++static HRESULT WINAPI video_capture_source_Stop(IMFMediaSource *iface)
++{
++    return MF_E_SHUTDOWN;
++}
++
++static HRESULT WINAPI video_capture_source_Pause(IMFMediaSource *iface)
++{
++    return MF_E_SHUTDOWN;
++}
++
++static HRESULT WINAPI video_capture_source_Shutdown(IMFMediaSource *iface)
++{
++    return S_OK;
++}
++
++static const IMFMediaSourceVtbl video_capture_source_vtbl =
++{
++    video_capture_source_QueryInterface,
++    video_capture_source_AddRef,
++    video_capture_source_Release,
++    video_capture_source_GetEvent,
++    video_capture_source_BeginGetEvent,
++    video_capture_source_EndGetEvent,
++    video_capture_source_QueueEvent,
++    video_capture_source_GetCharacteristics,
++    video_capture_source_CreatePresentationDescriptor,
++    video_capture_source_Start,
++    video_capture_source_Stop,
++    video_capture_source_Pause,
++    video_capture_source_Shutdown,
++};
++
++static HRESULT video_capture_create_object(IMFAttributes *attributes, void *context, IUnknown **object)
++{
++    struct video_capture_source *source;
++
++    TRACE("%p, %p, %p.\n", attributes, context, object);
++
++    if (!(source = calloc(1, sizeof(*source))))
++        return E_OUTOFMEMORY;
++
++    source->IMFMediaSource_iface.lpVtbl = &video_capture_source_vtbl;
++    source->refcount = 1;
++    *object = (IUnknown *)&source->IMFMediaSource_iface;
++
++    return S_OK;
++}
++
++static void video_capture_shutdown_object(void *context, IUnknown *object)
++{
++    TRACE("%p, %p.\n", context, object);
++}
++
++static void video_capture_free_private(void *context)
++{
++    TRACE("%p.\n", context);
++}
++
++static const struct activate_funcs video_capture_activate_funcs =
++{
++    video_capture_create_object,
++    video_capture_shutdown_object,
++    video_capture_free_private,
++};
++
++/* Cameras come from the DirectShow device enumerator, which knows the V4L2 devices. */
++static HRESULT enum_video_capture_sources(IMFActivate ***ret_sources, UINT32 *ret_count)
++{
++    ICreateDevEnum *dev_enum = NULL;
++    IEnumMoniker *enum_moniker = NULL;
++    IMFActivate **sources = NULL, **tmp;
++    UINT32 count = 0, capacity = 0;
++    IMoniker *moniker;
++    BOOL uninit_com;
++    HRESULT hr;
++
++    *ret_sources = NULL;
++    *ret_count = 0;
++
++    uninit_com = SUCCEEDED(CoInitializeEx(NULL, COINIT_MULTITHREADED));
++
++    if (FAILED(hr = CoCreateInstance(&CLSID_SystemDeviceEnum, NULL, CLSCTX_INPROC_SERVER,
++            &IID_ICreateDevEnum, (void **)&dev_enum)))
++        goto done;
++    if (ICreateDevEnum_CreateClassEnumerator(dev_enum, &CLSID_VideoInputDeviceCategory, &enum_moniker, 0) != S_OK)
++    {
++        hr = S_OK;
++        goto done;
++    }
++
++    while (IEnumMoniker_Next(enum_moniker, 1, &moniker, NULL) == S_OK)
++    {
++        VARIANT name, path;
++        IPropertyBag *bag;
++
++        VariantInit(&name);
++        VariantInit(&path);
++
++        if (SUCCEEDED(IMoniker_BindToStorage(moniker, NULL, NULL, &IID_IPropertyBag, (void **)&bag)))
++        {
++            if (SUCCEEDED(IPropertyBag_Read(bag, L"FriendlyName", &name, NULL)) && V_VT(&name) == VT_BSTR
++                    && SUCCEEDED(IPropertyBag_Read(bag, L"DevicePath", &path, NULL)) && V_VT(&path) == VT_BSTR)
++            {
++                IMFActivate *activate;
++
++                if (count == capacity)
++                {
++                    capacity = capacity ? capacity * 2 : 4;
++                    if (!(tmp = CoTaskMemRealloc(sources, capacity * sizeof(*sources))))
++                    {
++                        hr = E_OUTOFMEMORY;
++                        VariantClear(&name);
++                        VariantClear(&path);
++                        IPropertyBag_Release(bag);
++                        IMoniker_Release(moniker);
++                        goto done;
++                    }
++                    sources = tmp;
++                }
++
++                if (SUCCEEDED(create_activation_object(NULL, &video_capture_activate_funcs, &activate)))
++                {
++                    IMFActivate_SetGUID(activate, &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
++                            &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
++                    IMFActivate_SetString(activate, &MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, V_BSTR(&name));
++                    IMFActivate_SetString(activate, &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
++                            V_BSTR(&path));
++                    TRACE("camera %s, link %s.\n", debugstr_w(V_BSTR(&name)), debugstr_w(V_BSTR(&path)));
++                    sources[count++] = activate;
++                }
++            }
++            VariantClear(&name);
++            VariantClear(&path);
++            IPropertyBag_Release(bag);
++        }
++        IMoniker_Release(moniker);
++    }
++    hr = S_OK;
++
++done:
++    if (FAILED(hr))
++    {
++        while (count)
++            IMFActivate_Release(sources[--count]);
++        CoTaskMemFree(sources);
++        sources = NULL;
++    }
++    else
++    {
++        *ret_sources = sources;
++        *ret_count = count;
++    }
++    if (enum_moniker)
++        IEnumMoniker_Release(enum_moniker);
++    if (dev_enum)
++        ICreateDevEnum_Release(dev_enum);
++    if (uninit_com)
++        CoUninitialize();
++
++    TRACE("ret %#lx, count %u.\n", hr, *ret_count);
++    return hr;
++}
++
+ /***********************************************************************
+  *      MFEnumDeviceSources (mf.@)
+  */
+@@ -761,11 +1024,7 @@
+         return hr;
+ 
+     if (IsEqualGUID(&source_type, &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID))
+-    {
+-        FIXME("Not implemented for video capture devices.\n");
+-        *ret_count = 0;
+-        return S_OK;
+-    }
++        return enum_video_capture_sources(sources, ret_count);
+     if (IsEqualGUID(&source_type, &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_GUID))
+         return enum_audio_capture_sources(attributes, sources, ret_count);
+ 

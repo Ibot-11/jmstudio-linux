@@ -2,26 +2,30 @@
 
 Run **JMStudio**, the Windows software for the **3DMakerpro Moose** 3D scanner (and its siblings), on Linux through **Proton**.
 
-> Deutsche Anleitung: [weiter unten](#deutsch).
+> Deutsche Kurzfassung: [weiter unten](#deutsch).
 
 This is an unofficial helper. It is not affiliated with 3DMakerpro or JMMeta. JMStudio is proprietary and **not included**: you download the installer yourself and this repo sets everything else up around it.
 
-## Status
+## Status: work in progress
+
+JMStudio installs and starts, and with the camera fix it recognises the scanner. **Scanning does not work yet:** JMStudio still reports "Connect scanner failed!" and I have not found out why. Details below, help is welcome.
 
 | Part | State |
 | --- | --- |
-| Prefix creation with Proton Experimental inside the Steam Linux Runtime | tested (CachyOS, Proton Experimental 11.0, Wine 11.0) |
-| `setup`, exe detection, menu entry, `run`, `--debug` logs, `winetricks` | tested with stand-in programs |
-| Proton's USB (`wineusb`) and camera (`qcap`) stack | present and enumerating host USB devices |
-| **Real JMStudio installer and the Moose scanner** | **not verified yet.** Please report what you see (see [Reporting](#reporting-results)) |
+| Proton Experimental prefix, `setup`, `run`, logs, menu entry | works (CachyOS, Proton Experimental 11.0 / Wine 11.0, JMStudio 2.6.17) |
+| USB access (`udev` rules) | works, tested with a Moose (`bcdc:000a`, `bcdc:000b`) |
+| **Camera fix** (patched Wine `devenum.dll` and `mf.dll`) | JMStudio then finds the scanner's serial number, switches from the default "CR-Scan Lizard" to **Moose** and loads `moosePlugin.dll` |
+| Camera capture | works in a test program using JMStudio's own OpenCV: both cameras open through DirectShow and deliver frames |
+| **Connecting to the scanner in JMStudio** | **fails.** `Create Moose_ICT_130W Module`, `Searching camera list...`, then `Connect scanner failed!` every 3 s, without trying to open a camera |
 
-The Moose does not need a kernel driver: it shows up as two UVC cameras behind a small USB hub (`bcdc:000a` and `bcdc:000b`, "ICTCamera A/B", on the unit tested here; `0c45:636a`/`636b`, "KYT Camera A/B", in a forum report). Linux creates `/dev/video0..3` for them, but the device nodes under `/dev/bus/usb` are `root:root 0664`, so Wine cannot open them for writing without the udev rule. Each camera also exposes a vendor-specific UVC Extension Unit, which is something Wine may or may not be able to reach. A [forum thread](https://forum.endeavouros.com/t/3d-scanner-sorftware-for-3dmakerpro-moose-3d-scanner/77272) reports that the Windows software did not detect the scanner on Linux (it is not clear how it was run there). Missing USB permissions are the first thing to rule out, and that is what the udev rules here address.
+Without the camera fix JMStudio never identifies the scanner at all, so it is a required step.
 
 ## Requirements
 
 - Steam with **Proton Experimental** installed (Library > Tools). Its Steam Linux Runtime comes along automatically.
 - A Vulkan capable GPU and recent Mesa/NVIDIA drivers.
 - `bash`, `usbutils` (`lsusb`). Optional: `winetricks`, `vulkan-tools`.
+- For the camera fix: `clang`, `lld`, `flex`, `bison`, `gcc`, `make`, `patch`, `curl`, `tar`, `xz`. It downloads the 33 MB Wine 11.0 source release once and builds two DLLs in about 10 seconds.
 - A free JMMeta account to download the installer.
 
 Other options: any other Proton (for example GE-Proton) via `--proton`, or plain system Wine via `--runner wine`.
@@ -38,21 +42,25 @@ cd jmstudio-linux
    ```bash
    ./jmstudio-linux setup ~/Downloads/JMStudioSetup-*.exe
    ```
-   The installer window opens; click through it as on Windows. `--silent` tries an unattended install.
-3. Give your user access to the scanner (once, asks for sudo):
+   The installer window opens; click through it as on Windows. JMStudio starts at the end; close it so `setup` can finish.
+3. Give your user access to the scanner (once; a graphical password dialog or `sudo` asks for your password):
    ```bash
    ./jmstudio-linux udev
    ```
-4. Plug the scanner in (directly into a USB 2.0 port if you can) and check:
+4. Install the camera fix (builds two patched Wine DLLs and puts them into the prefix):
+   ```bash
+   ./jmstudio-linux camerafix
+   ```
+5. Plug the scanner in and check:
    ```bash
    ./jmstudio-linux doctor
    ```
-5. Start it, or use the new "JMStudio (3DMakerpro)" entry in your application menu:
+6. Start it, or use the "JMStudio (3DMakerpro)" entry in your application menu:
    ```bash
    ./jmstudio-linux run
    ```
 
-The first start of JMStudio needs an internet connection (vendor requirement).
+The first start of JMStudio needs an internet connection and a login (vendor requirement).
 
 ## Commands
 
@@ -60,36 +68,47 @@ The first start of JMStudio needs an internet connection (vendor requirement).
 | --- | --- |
 | `setup [INSTALLER.exe]` | Create the prefix, run the installer, find `JMStudio.exe`, add the menu entry. Looks in `~/Downloads` if no path is given. |
 | `run [args]` | Start JMStudio (default command). |
-| `doctor` | Check Proton, container runtime, installation, scanner USB access, GPUs. |
-| `udev` | Install `udev/70-3dmakerpro.rules` (uses `sudo`). |
+| `doctor` | Check Proton, container runtime, installation, camera fix, scanner USB access, GPUs. |
+| `udev` | Install `udev/70-3dmakerpro.rules` (asks for your password). |
+| `camerafix [build\|install\|remove\|status]` | Build and install, or remove, the patched Wine DLLs (default: install). |
 | `desktop` | Recreate the application menu entry. |
 | `set-exe PATH` | Point the launcher at `JMStudio.exe` if auto-detection fails. |
 | `winecfg`, `regedit`, `cmd` | Wine tools inside the prefix. |
-| `winetricks VERB...` | Run winetricks against the prefix, for example `vcrun2022`. |
+| `winetricks VERB...` | Run winetricks against the prefix. |
 | `logs` | Print the newest Proton log. |
 | `uninstall` | Remove the menu entry and, after asking, the whole prefix. |
 
-Options: `--debug` (write a log with USB/camera tracing), `--proton NAME|DIR`, `--runner auto|slr|proton|wine`.
+Options: `--debug` (write a Proton log; set `WINEDEBUG` yourself for other channels), `--proton NAME|DIR`, `--runner auto|slr|proton|wine`.
 Environment: `JMSTUDIO_HOME` (default `~/.local/share/jmstudio-linux`), `JMSTUDIO_PROTON`, `JMSTUDIO_RUNNER`.
 Extra variables for JMStudio go into `~/.config/jmstudio-linux/env` as `export NAME=value` lines.
 
-## How it works
+## What the camera fix does and why
 
-- A dedicated Proton prefix lives in `~/.local/share/jmstudio-linux/prefix`, so nothing touches your Steam games.
-- Proton runs inside the Steam Linux Runtime container, exactly like Steam does it, but without the Steam client in the loop.
-- Wine reaches the scanner over libusb (`wineusb`) and its cameras over V4L2 (`qcap`). Both need access to `/dev/bus/usb`, which the udev rules grant to the logged-in user via the `uaccess` tag.
-- Files: Wine's `Z:` drive is your whole filesystem, so save scans anywhere under `Z:\home\<you>\`.
+The Moose is two UVC cameras behind a USB hub. JMStudio finds it like this: it asks Qt for the list of cameras, reads each camera's name and ID, and derives the scanner's serial number (for example `JMM3004751`) from them. The serial number decides which device plugin is loaded. Stock Wine breaks this in two places:
+
+1. **DirectShow reports a fake `DevicePath`.** Wine's `devenum.dll` reports every camera as `dummy_video0`. Windows reports `\\?\usb#vid_bcdc&pid_000a&mi_00#...`, and JMStudio reads the vendor and product ID from it. [`patches/0001-devenum-usb-device-path.patch`](patches/0001-devenum-usb-device-path.patch) builds that path from sysfs.
+2. **Media Foundation lists no cameras.** Qt 6.2's camera list uses `MFEnumDeviceSources`, which Wine answers with "Not implemented for video capture devices". [`patches/0002-mf-enumerate-video-capture-devices.patch`](patches/0002-mf-enumerate-video-capture-devices.patch) enumerates the cameras (through the same DirectShow list). Capture itself is not implemented there; activating a camera returns a source that refuses every request, which Qt handles gracefully.
+
+`jmstudio-linux camerafix` builds both DLLs from the signed Wine 11.0 release sources (SHA-256 pinned) with `clang`, and installs them **only into the JMStudio prefix**: the prefix's symlinks into Proton are replaced by the patched files, the originals are kept as `*.orig`, and `camerafix remove` puts everything back. Proton itself is not touched. No binaries are shipped, only the patches. After a Proton update or prefix upgrade, run `camerafix` again; `doctor` tells you when it is missing.
+
+## Open problem: "Connect scanner failed!"
+
+What I know, in case you want to dig in:
+
+- JMStudio's own log is in `~/.local/share/jmstudio-linux/prefix/pfx/drive_c/users/steamuser/AppData/Roaming/Jimuyida/JMStudio/log/`. With the camera fix it shows `Current device is Moose`, the serial number, `Loaded successfully: ...moosePlugin.dll`, then the failing connect.
+- The Moose module (`Moose_ICT_130W` in `JMDeviceCore.dll`) opens its cameras through OpenCV 3.4.16 (`cv::VideoCapture::open`). In a test program ([`tools/opencv-capture.c`](tools/opencv-capture.c)) that same OpenCV DLL opens both cameras through DirectShow and `grab()` succeeds, so the camera pipeline works under Proton. The Media Foundation backend fails, as expected.
+- In JMStudio the failure happens about 20 ms after "Searching camera list...", before any camera is opened, so the condition that fails is somewhere before the OpenCV call. I have not found it.
+- JMStudio also contains USB speed checks ("USB port is not Super-speed"), and the Moose here sits behind a USB 2.0 hub at 480 Mbit/s. I have not checked whether that matters.
+
+If you can read x64 disassembly or have the scanner connected to a USB 3 port, reports are very welcome.
 
 ## Troubleshooting
 
 **JMStudio does not see the scanner**
-1. `./jmstudio-linux doctor` - fix everything it marks `FAIL`, then replug the scanner.
-2. Try another USB port, ideally USB 2.0 and without a hub.
-3. Run `./jmstudio-linux --debug run`, connect the scanner, close the program and look at what Wine saw:
-   ```bash
-   grep -iE 'wineusb|qcap|dshow|mfplat|err:' "$(./jmstudio-linux logs)" | less
-   ```
-4. Try another runner: `--proton GE-Proton11-7-x86_64` or `--runner wine`.
+1. `./jmstudio-linux doctor` - fix everything it marks `FAIL`.
+2. Try another USB port, ideally USB 3 and without a hub.
+3. `./jmstudio-linux --debug run`, connect the scanner, close the program, then inspect the log: `grep -iE 'devenum|mfplat|err:' "$(./jmstudio-linux logs)" | less`. For more channels: `WINEDEBUG='+timestamp,+devenum,+mfplat,err+all' ./jmstudio-linux --debug run`.
+4. Try another runner: `--proton GE-Proton11-7-x86_64` or `--runner wine` (the camera fix is built against Wine 11.0 and is only tested with Proton Experimental).
 
 **Installer fails or the program crashes at start** - install the Visual C++ runtime with `./jmstudio-linux winetricks vcrun2022` and try again.
 
@@ -101,11 +120,11 @@ Extra variables for JMStudio go into `~/.config/jmstudio-linux/env` as `export N
 
 ## Reporting results
 
-Open an issue and paste the output of `./jmstudio-linux doctor`, your distro, Proton version, and (if the scanner was not found) the filtered log from above. Reports that it *does* work are just as useful.
+Open an issue and paste the output of `./jmstudio-linux doctor`, your distro, Proton version, your scanner's `lsusb` IDs, and JMStudio's log from above. Reports that something *works* are just as useful.
 
 ## Legal
 
-The scripts are MIT licensed. JMStudio and all related names belong to their owners; this repo neither contains nor redistributes any of their software.
+The scripts are MIT licensed (see `LICENSE`). The files in `patches/` are changes to Wine and are licensed under the GNU LGPL 2.1 or later like Wine itself. JMStudio and all related names belong to their owners; this repo neither contains nor redistributes any of their software.
 
 ---
 
@@ -113,9 +132,11 @@ The scripts are MIT licensed. JMStudio and all related names belong to their own
 
 Mit diesem Repo läuft **JMStudio**, die Windows-Software für den **3DMakerpro Moose** 3D-Scanner, unter Linux über **Proton**. Inoffiziell, ohne Verbindung zu 3DMakerpro oder JMMeta. Die Software selbst ist **nicht enthalten**: Den Installer lädst du selbst herunter, den Rest richtet das Skript ein.
 
-**Stand:** Prefix-Erstellung mit Proton Experimental, Setup, Start, Debug-Logs und winetricks sind mit Stand-in-Programmen getestet. Mit dem **echten JMStudio-Installer und dem Moose-Scanner** ist es noch **nicht überprüft**, Rückmeldungen sind willkommen.
+**Stand: in Arbeit.** JMStudio installiert sich und startet. Mit dem Kamera-Fix erkennt es den Scanner (Seriennummer, Gerätemodell **Moose**, Moose-Plugin). **Scannen geht noch nicht:** JMStudio meldet weiterhin „Connect scanner failed!“, die Ursache ist offen. Die Kameras selbst liefern in einem Testprogramm mit JMStudios eigenem OpenCV Bilder.
 
-**Voraussetzungen:** Steam mit installiertem *Proton Experimental*, Vulkan-fähige GPU, `usbutils`, ein kostenloses JMMeta-Konto für den Download.
+**Warum der Kamera-Fix nötig ist:** Wine meldet für jede Kamera einen Platzhalter-Pfad (`dummy_video0`) und kann Videokameras nicht über Media Foundation auflisten. JMStudio ermittelt die Seriennummer aber genau darüber. Zwei kleine Wine-Patches (`patches/`) beheben das. Sie werden aus den signierten Wine-11.0-Quellen gebaut und nur in das JMStudio-Prefix installiert, Proton bleibt unverändert (`./jmstudio-linux camerafix remove` macht alles rückgängig).
+
+**Voraussetzungen:** Steam mit *Proton Experimental*, Vulkan-fähige GPU, `usbutils`, für den Kamera-Fix `clang`, `lld`, `flex`, `bison`, `gcc`, `make`, `patch`, `curl`; ein kostenloses JMMeta-Konto für den Download.
 
 **Schnellstart**
 
@@ -125,13 +146,10 @@ cd jmstudio-linux
 ```
 
 1. *JMStudio > Windows* von <https://forum.jimumeta.com/home/help/download.html> laden (Login nötig).
-2. Installieren: `./jmstudio-linux setup ~/Downloads/JMStudioSetup-*.exe`
-3. Einmalig USB-Rechte für den Scanner setzen (fragt nach sudo): `./jmstudio-linux udev`
-4. Scanner anstecken (am besten direkt an einen USB-2.0-Port) und prüfen: `./jmstudio-linux doctor`
-5. Starten: `./jmstudio-linux run` oder über den Menüeintrag "JMStudio (3DMakerpro)".
-
-Der erste Start von JMStudio braucht eine Internetverbindung.
-
-**Scanner wird nicht erkannt?** `doctor` ausführen und alle `FAIL`-Zeilen beheben, Scanner neu einstecken, anderen USB-Port testen. Mit `./jmstudio-linux --debug run` entsteht ein Log mit USB- und Kamera-Tracing (`./jmstudio-linux logs` zeigt den Pfad). Alternativ eine andere Proton-Version (`--proton GE-Proton11-7-x86_64`) oder `--runner wine` probieren.
+2. Installieren: `./jmstudio-linux setup ~/Downloads/JMStudioSetup-*.exe` (am Ende JMStudio schließen, damit `setup` fertig wird)
+3. Einmalig USB-Rechte setzen (Passwort-Dialog): `./jmstudio-linux udev`
+4. Kamera-Fix installieren: `./jmstudio-linux camerafix`
+5. Scanner anstecken und prüfen: `./jmstudio-linux doctor`
+6. Starten: `./jmstudio-linux run` oder über den Menüeintrag „JMStudio (3DMakerpro)“.
 
 **Dateien speichern:** Wines Laufwerk `Z:` ist dein ganzes Dateisystem, Scans also unter `Z:\home\<name>\` ablegen.
