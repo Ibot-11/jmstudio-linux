@@ -11,6 +11,9 @@
 #                      gain, ...). JMStudio sets the scanner's LED brightness through the
 #                      camera's exposure. Built as a renamed copy (qcapjm.dll + qcapjm.so),
 #                      because the Linux half cannot replace Proton's own qcap.so.
+#                0006: the camera filter waits for the next frame in poll() with a short timeout
+#                      instead of spinning, so stopping the graph cannot wait forever for a
+#                      camera that stopped sending frames (it held JMStudio's global OpenCV lock)
 #
 # All are built from the Wine 11.0 release sources with clang; nothing is installed.
 # Output: devenum.dll, mf.dll and overlay/{x86_64-windows/qcapjm.dll,x86_64-unix/qcapjm.so}.
@@ -72,4 +75,6 @@ rm -rf "$OUT/overlay"
 mkdir -p "$OUT/overlay/x86_64-windows" "$OUT/overlay/x86_64-unix"
 cp dlls/qcap/x86_64-windows/qcapjm.dll "$OUT/overlay/x86_64-windows/"
 cp dlls/qcap/qcapjm.so "$OUT/overlay/x86_64-unix/"
+# Which patches this build was made from; jmstudio-linux uses it to notice an out-of-date build.
+cat "$HERE"/0*.patch "$HERE/build.sh" | sha256sum | cut -d' ' -f1 > "$OUT/.built-patches"
 msg "built ${DLLS[*]} and the qcapjm overlay in $OUT"

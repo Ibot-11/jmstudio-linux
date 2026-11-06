@@ -1,0 +1,76 @@
+--- a/dlls/qcap/qcap_private.h
++++ b/dlls/qcap/qcap_private.h
+@@ -154,6 +154,11 @@
+     void                        *data;
+ };
+ 
++/* read_frame returns TRUE for a frame and FALSE for an error. It returns this when no frame arrived
++ * within a short time, so the caller can look at the stream state again instead of waiting for a
++ * camera that has stopped sending frames. */
++#define READ_FRAME_TIMEOUT 2
++
+ enum unix_funcs
+ {
+     unix_create,
+--- a/dlls/qcap/v4l.c
++++ b/dlls/qcap/v4l.c
+@@ -33,6 +33,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <fcntl.h>
++#include <poll.h>
+ #include <dlfcn.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+@@ -392,11 +393,25 @@
+ 
+     while (video_read(device->fd, device->image_data, device->image_size) < 0)
+     {
++        struct pollfd pfd = { .fd = device->fd, .events = POLLIN };
++        int ret;
++
+         if (errno != EAGAIN)
+         {
+             ERR("Failed to read frame: %s\n", strerror(errno));
+             return FALSE;
+         }
++
++        /* The device is non-blocking. Wait in poll() instead of spinning, and give up after a short
++         * while: a camera that stops sending frames must not keep the stream thread inside this call,
++         * because stopping the graph waits for that thread without a time limit. */
++        ret = poll(&pfd, 1, 50);
++        if (!ret) return READ_FRAME_TIMEOUT;
++        if (ret < 0 && errno != EINTR)
++        {
++            ERR("Failed to wait for a frame: %s\n", strerror(errno));
++            return FALSE;
++        }
+     }
+ 
+     reverse_image(device, params->data, device->image_data);
+--- a/dlls/qcap/vfwcapture.c
++++ b/dlls/qcap/vfwcapture.c
+@@ -155,6 +155,7 @@
+     for (;;)
+     {
+         IMediaSample *sample;
++        NTSTATUS status;
+         HRESULT hr;
+         BYTE *data;
+ 
+@@ -182,7 +183,14 @@
+ 
+         params.device = filter->device;
+         params.data = data;
+-        if (!V4L_CALL( read_frame, &params ))
++        status = V4L_CALL( read_frame, &params );
++        if (status == READ_FRAME_TIMEOUT)
++        {
++            /* No frame yet; go round to see whether the stream is being paused or stopped. */
++            IMediaSample_Release(sample);
++            continue;
++        }
++        if (!status)
+         {
+             IMediaSample_Release(sample);
+             break;

@@ -376,15 +376,25 @@ camerafix_installed() {
 	[[ -f $CAMERAFIX_DIR/overlay/x86_64-unix/qcapjm.so && -f "$(camerafix_target qcapjm)" ]]
 }
 
+# The patches change between versions; build.sh records which ones a build was made from.
+camerafix_patch_hash() { cat "$SCRIPT_DIR"/patches/0*.patch "$SCRIPT_DIR/patches/build.sh" | sha256sum | cut -d' ' -f1; }
+
+# True when the build in the prefix was made from the patches in this checkout.
+camerafix_current() {
+	[[ -f $CAMERAFIX_DIR/.installed-patches && "$(<"$CAMERAFIX_DIR/.installed-patches")" == "$(camerafix_patch_hash)" ]]
+}
+
 camerafix_install() {
-	local d t
+	local d t build=0
 	for d in "${CAMERAFIX_DLLS[@]}"; do
-		if [[ ! -f $CAMERAFIX_DIR/$d.dll || ! -f $CAMERAFIX_DIR/overlay/x86_64-unix/qcapjm.so ]]; then
-			msg "building the patched DLLs"
-			"$SCRIPT_DIR/patches/build.sh" "$CAMERAFIX_DIR"
-			break
-		fi
+		[[ -f $CAMERAFIX_DIR/$d.dll ]] || build=1
 	done
+	[[ -f $CAMERAFIX_DIR/overlay/x86_64-unix/qcapjm.so && -f $CAMERAFIX_DIR/.built-patches \
+		&& "$(<"$CAMERAFIX_DIR/.built-patches")" == "$(camerafix_patch_hash)" ]] || build=1
+	if (( build )); then
+		msg "building the patched DLLs"
+		"$SCRIPT_DIR/patches/build.sh" "$CAMERAFIX_DIR"
+	fi
 	for d in "${CAMERAFIX_DLLS[@]}"; do
 		t="$(camerafix_target "$d")"
 		[[ -e $t || -L $t ]] || die "no prefix yet - run: jmstudio-linux setup"
@@ -400,6 +410,7 @@ camerafix_install() {
 	t="$(camerafix_target qcapjm)"
 	cp --remove-destination "$CAMERAFIX_DIR/overlay/x86_64-windows/qcapjm.dll" "$t"
 	run_in_prefix reg add "$QCAP_KEY" /ve /d 'C:\windows\system32\qcapjm.dll' /f
+	cp "$CAMERAFIX_DIR/.built-patches" "$CAMERAFIX_DIR/.installed-patches"
 	msg "camera fix installed - restart JMStudio"
 }
 
@@ -489,7 +500,9 @@ cmd_doctor() {
 	echo "JMStudio"
 	load_state
 	if [[ -n $EXE && -f $EXE ]]; then pass "installed: $EXE"; else fail "not set up - run: jmstudio-linux setup"; fi
-	if camerafix_installed; then pass "camera fix (patched devenum.dll, mf.dll and qcapjm) installed"
+	if camerafix_installed; then
+		if camerafix_current; then pass "camera fix (patched devenum.dll, mf.dll and qcapjm) installed"
+		else fail "camera fix is older than the patches in this checkout (newer ones fix hangs when the scanner is stopped). Run: $SCRIPT camerafix"; fi
 	else fail "camera fix missing - JMStudio cannot find the scanner. Run: $SCRIPT camerafix"; fi
 
 	echo "Scanner (USB)"
@@ -713,7 +726,7 @@ EOF
 	install_udev
 
 	step 5 "Camera fix"
-	if camerafix_installed; then ok "already installed"; else camerafix_install; fi
+	if camerafix_installed && camerafix_current; then ok "already installed"; else camerafix_install; fi
 	install_link
 	cmd_desktop
 
