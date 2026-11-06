@@ -24,8 +24,9 @@ DEBUG=0
 SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT")"
 
-# USB IDs of the scanner's stereo cameras (see udev/70-3dmakerpro.rules)
-KNOWN_IDS=(0c45:636a 0c45:636b)
+# USB IDs of the scanner's stereo cameras (see udev/70-3dmakerpro.rules);
+# "bcdc:" matches every product of that vendor ID.
+KNOWN_IDS=(bcdc: 0c45:636a 0c45:636b)
 
 # Filled in by resolve_runner
 PROTON_DIR="" SLR_ENTRY="" STEAM_ROOT="" EXE=""
@@ -361,15 +362,17 @@ cmd_doctor() {
 	if [[ -n $EXE && -f $EXE ]]; then pass "installed: $EXE"; else fail "not set up - run: jmstudio-linux setup"; fi
 
 	echo "Scanner (USB)"
-	local id found=0 line bus dev node
+	local id found=0 line bus dev node name
 	for id in "${KNOWN_IDS[@]}"; do
-		line="$(lsusb -d "$id" 2>/dev/null | head -1)" || true
-		[[ -n $line ]] || continue
-		found=1
-		bus="$(awk '{print $2}' <<<"$line")"; dev="$(awk '{print $4}' <<<"$line")"; dev="${dev%:}"
-		node="/dev/bus/usb/$bus/$dev"
-		if [[ -r $node && -w $node ]]; then pass "$id accessible ($node)"
-		else fail "$id found but $node is not accessible - run: $SCRIPT udev, then replug"; fi
+		while IFS= read -r line; do
+			[[ -n $line ]] || continue
+			found=1
+			bus="$(awk '{print $2}' <<<"$line")"; dev="$(awk '{print $4}' <<<"$line")"; dev="${dev%:}"
+			node="/dev/bus/usb/$bus/$dev"
+			name="${line#*ID }"
+			if [[ -r $node && -w $node ]]; then pass "$name is accessible ($node)"
+			else fail "$name found but $node is not writable - run: $SCRIPT udev, then replug"; fi
+		done < <(lsusb -d "$id" 2>/dev/null || true)
 	done
 	if (( ! found )); then
 		fail "scanner not found (looked for ${KNOWN_IDS[*]}). Plugged in? Try another USB 2.0 port without a hub."

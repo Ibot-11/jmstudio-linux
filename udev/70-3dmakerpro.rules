@@ -1,11 +1,16 @@
-# 3DMakerpro Moose: the two stereo cameras ("KYT Camera A/B") behind the scanner's USB hub.
+# 3DMakerpro Moose: the two stereo cameras behind the scanner's USB hub.
 #
 # Wine/Proton talks to the scanner through libusb, which needs read/write access to
-# /dev/bus/usb/<bus>/<dev>. "uaccess" gives that to whoever is logged in at the seat,
+# /dev/bus/usb/<bus>/<dev>. By default those nodes are root:root 0664, so a normal user
+# can read but not write them. "uaccess" gives the logged-in user access via logind,
 # so no group membership or world-writable device node is needed.
+#
+# bcdc:000a / bcdc:000b  "ICTCamera A/B", serial JMM..., seen on a Moose bought in 2026
+# 0c45:636a / 0c45:636b  "KYT Camera A/B", reported on a forum for another unit
 #
 # Other 3DMakerpro scanners (Moose Lite, Fox, ...) may use other IDs: find them with
 # `lsusb` while the scanner is plugged in and add a line below (and to KNOWN_IDS in
-# jmstudio-linux), then `sudo udevadm control --reload-rules`.
+# jmstudio-linux), then run `jmstudio-linux udev`.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="bcdc", TAG+="uaccess"
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0c45", ATTR{idProduct}=="636a", TAG+="uaccess"
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0c45", ATTR{idProduct}=="636b", TAG+="uaccess"

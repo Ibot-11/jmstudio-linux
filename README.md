@@ -15,7 +15,7 @@ This is an unofficial helper. It is not affiliated with 3DMakerpro or JMMeta. JM
 | Proton's USB (`wineusb`) and camera (`qcap`) stack | present and enumerating host USB devices |
 | **Real JMStudio installer and the Moose scanner** | **not verified yet.** Please report what you see (see [Reporting](#reporting-results)) |
 
-The Moose does not need a kernel driver: it shows up as two UVC cameras (`0c45:636a` and `0c45:636b`, "KYT Camera A/B") behind a small USB hub. A [forum thread](https://forum.endeavouros.com/t/3d-scanner-sorftware-for-3dmakerpro-moose-3d-scanner/77272) reports that the Windows software did not detect the scanner on Linux (it is not clear how it was run there). Missing USB permissions are the first thing to rule out, and that is what the udev rules here address.
+The Moose does not need a kernel driver: it shows up as two UVC cameras behind a small USB hub (`bcdc:000a` and `bcdc:000b`, "ICTCamera A/B", on the unit tested here; `0c45:636a`/`636b`, "KYT Camera A/B", in a forum report). Linux creates `/dev/video0..3` for them, but the device nodes under `/dev/bus/usb` are `root:root 0664`, so Wine cannot open them for writing without the udev rule. Each camera also exposes a vendor-specific UVC Extension Unit, which is something Wine may or may not be able to reach. A [forum thread](https://forum.endeavouros.com/t/3d-scanner-sorftware-for-3dmakerpro-moose-3d-scanner/77272) reports that the Windows software did not detect the scanner on Linux (it is not clear how it was run there). Missing USB permissions are the first thing to rule out, and that is what the udev rules here address.
 
 ## Requirements
 
