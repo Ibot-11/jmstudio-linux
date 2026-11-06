@@ -36,8 +36,26 @@ int main(void)
                 else wprintf(L"  %-12ls : not available (hr=%08lx)\n", names[i], hr);
                 VariantClear(&v);
             }
-            wprintf(L"\n");
             IPropertyBag_Release(bag);
+        }
+        {
+            LPOLESTR display_name = NULL;
+            IBindCtx *bind_ctx = NULL;
+            IMoniker *parsed = NULL;
+            ULONG eaten = 0;
+
+            hr = IMoniker_GetDisplayName(moniker, NULL, NULL, &display_name);
+            wprintf(L"  %-12ls = %ls (hr=%08lx)\n", L"DisplayName", display_name ? display_name : L"(none)", hr);
+            if (display_name && SUCCEEDED(CreateBindCtx(0, &bind_ctx)))
+            {
+                hr = MkParseDisplayName(bind_ctx, display_name, &eaten, &parsed);
+                wprintf(L"  %-12ls : MkParseDisplayName hr=%08lx%ls\n", L"round trip", hr,
+                        parsed ? L" (moniker found)" : L"");
+                if (parsed) IMoniker_Release(parsed);
+                IBindCtx_Release(bind_ctx);
+            }
+            CoTaskMemFree(display_name);
+            wprintf(L"\n");
         }
         IMoniker_Release(moniker);
     }

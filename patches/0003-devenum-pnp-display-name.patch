@@ -1,0 +1,106 @@
+--- a/dlls/devenum/mediacatenum.c
++++ b/dlls/devenum/mediacatenum.c
+@@ -690,11 +690,31 @@
+     return MK_S_HIM;
+ }
+ 
++/* USB cameras are named after their DevicePath, as on Windows ("@device:pnp:\\?\usb#vid_...");
++ * applications read the vendor and product ID from the display name. */
++static BSTR get_video_device_path(struct moniker *moniker)
++{
++    VARIANT var;
++
++    if (moniker->type != DEVICE_CODEC || !moniker->has_class
++            || !IsEqualGUID(&moniker->class, &CLSID_VideoInputDeviceCategory))
++        return NULL;
++
++    VariantInit(&var);
++    if (SUCCEEDED(IPropertyBag_Read(&moniker->IPropertyBag_iface, L"DevicePath", &var, NULL))
++            && V_VT(&var) == VT_BSTR && !wcsncmp(V_BSTR(&var), L"\\\\?\\", 4))
++        return V_BSTR(&var);
++
++    VariantClear(&var);
++    return NULL;
++}
++
+ static HRESULT WINAPI moniker_GetDisplayName(IMoniker *iface, IBindCtx *pbc,
+         IMoniker *pmkToLeft, LPOLESTR *ppszDisplayName)
+ {
+     struct moniker *This = impl_from_IMoniker(iface);
+     WCHAR *buffer;
++    BSTR device_path;
+ 
+     TRACE("(%p)->(%p, %p, %p)\n", iface, pbc, pmkToLeft, ppszDisplayName);
+ 
+@@ -709,6 +729,17 @@
+         StringFromGUID2(&This->clsid, buffer + wcslen(buffer), CHARS_IN_GUID);
+         StringFromGUID2(&This->class, buffer + wcslen(buffer), CHARS_IN_GUID);
+     }
++    else if ((device_path = get_video_device_path(This)))
++    {
++        buffer = CoTaskMemAlloc((12 + wcslen(device_path) + 1) * sizeof(WCHAR));
++        if (buffer)
++        {
++            wcscpy(buffer, L"@device:pnp:");
++            wcscat(buffer, device_path);
++        }
++        SysFreeString(device_path);
++        if (!buffer) return E_OUTOFMEMORY;
++    }
+     else
+     {
+         buffer = CoTaskMemAlloc((11 + (This->has_class ? CHARS_IN_GUID : 0)
+--- a/dlls/devenum/parsedisplayname.c
++++ b/dlls/devenum/parsedisplayname.c
+@@ -61,6 +61,42 @@
+     return 1; /* non-heap based object */
+ }
+ 
++/* "@device:pnp:<DevicePath>" names a video capture device by its DevicePath. */
++static HRESULT parse_pnp_display_name(const WCHAR *path, IMoniker **ret)
++{
++    IEnumMoniker *enum_moniker;
++    IMoniker *moniker;
++    HRESULT hr = MK_E_NOOBJECT;
++
++    if (ICreateDevEnum_CreateClassEnumerator(&devenum_factory, &CLSID_VideoInputDeviceCategory,
++            &enum_moniker, 0) != S_OK)
++        return hr;
++
++    while (hr != S_OK && IEnumMoniker_Next(enum_moniker, 1, &moniker, NULL) == S_OK)
++    {
++        IPropertyBag *bag;
++        VARIANT var;
++
++        VariantInit(&var);
++        if (SUCCEEDED(IMoniker_BindToStorage(moniker, NULL, NULL, &IID_IPropertyBag, (void **)&bag)))
++        {
++            if (SUCCEEDED(IPropertyBag_Read(bag, L"DevicePath", &var, NULL)) && V_VT(&var) == VT_BSTR
++                    && !_wcsicmp(V_BSTR(&var), path))
++            {
++                *ret = moniker;
++                IMoniker_AddRef(moniker);
++                hr = S_OK;
++            }
++            VariantClear(&var);
++            IPropertyBag_Release(bag);
++        }
++        IMoniker_Release(moniker);
++    }
++
++    IEnumMoniker_Release(enum_moniker);
++    return hr;
++}
++
+ static HRESULT WINAPI devenum_parser_ParseDisplayName(IParseDisplayName *iface,
+         IBindCtx *pbc, LPOLESTR name, ULONG *eaten, IMoniker **ret)
+ {
+@@ -92,6 +128,8 @@
+         type = DEVICE_DMO;
+         name += 4;
+     }
++    else if (!wcsncmp(name, L"pnp:", 4))
++        return parse_pnp_display_name(name + 4, ret);
+     else
+     {
+         FIXME("unhandled device type %s\n", debugstr_w(name));

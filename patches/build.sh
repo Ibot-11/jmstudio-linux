@@ -3,6 +3,8 @@
 #
 #   devenum.dll  0001: DirectShow reports a Windows-style USB DevicePath for each camera
 #                      (Wine says "dummy_videoN", so JMStudio cannot read the vendor/product ID)
+#                0003: the camera's display name is "@device:pnp:<DevicePath>" like on Windows
+#                      (JMStudio's Moose module parses vid_/&mi_ out of it)
 #   mf.dll       0002: Media Foundation lists the cameras (Qt's camera list, which JMStudio
 #                      uses to find the scanner's serial number, is empty without it)
 #
