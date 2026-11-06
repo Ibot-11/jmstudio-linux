@@ -20,6 +20,23 @@ JMStudio installs, starts, and with the camera fix it **recognises and connects 
 
 Without the camera fix JMStudio never identifies the scanner at all, so it is a required step.
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Ibot-11/jmstudio-linux/main/install.sh | bash
+```
+
+Prefer to read it first? Clone the repo and run `./install.sh`. The installer does everything in order and asks before each step that changes your system:
+
+1. **Requirements:** Steam and Proton Experimental (it can open Steam's install dialog for you), and the build tools for the camera fix (it offers the matching `pacman`/`apt`/`dnf`/`zypper` command).
+2. **JMStudio installer:** it cannot be downloaded automatically (JMMeta login), so the installer opens the download page and waits until the file appears in `~/Downloads`.
+3. **Installs JMStudio** unattended into its own Proton prefix.
+4. **USB permissions** for the scanner (one password prompt).
+5. **Camera fix:** builds and installs the patched Wine DLLs (about 10 seconds plus a 33 MB download).
+6. **Check:** adds the menu entry and runs `doctor`.
+
+A complete run takes about half a minute plus the download. Run it again at any time to repair or update; finished steps are skipped. `install --yes` answers every question with yes. To remove everything: `jmstudio-linux uninstall`.
+
 ## Requirements
 
 - Steam with **Proton Experimental** installed (Library > Tools). Its Steam Linux Runtime comes along automatically.
@@ -30,7 +47,9 @@ Without the camera fix JMStudio never identifies the scanner at all, so it is a 
 
 Other options: any other Proton (for example GE-Proton) via `--proton`, or plain system Wine via `--runner wine`.
 
-## Quick start
+## Manual installation
+
+The same steps by hand, if you want control:
 
 ```bash
 git clone https://github.com/Ibot-11/jmstudio-linux.git
@@ -38,11 +57,10 @@ cd jmstudio-linux
 ```
 
 1. Download **JMStudio > Windows** from <https://forum.jimumeta.com/home/help/download.html> (login required).
-2. Install it into a fresh Proton prefix:
+2. Install it into a fresh Proton prefix (`--silent` runs the Windows installer unattended and closes the first start that the installer triggers; without it the installer window opens and you click through it, then close JMStudio so `setup` can finish):
    ```bash
-   ./jmstudio-linux setup ~/Downloads/JMStudioSetup-*.exe
+   ./jmstudio-linux setup --silent ~/Downloads/JMStudioSetup-*.exe
    ```
-   The installer window opens; click through it as on Windows. JMStudio starts at the end; close it so `setup` can finish.
 3. Give your user access to the scanner (once; a graphical password dialog or `sudo` asks for your password):
    ```bash
    ./jmstudio-linux udev
@@ -66,7 +84,8 @@ The first start of JMStudio needs an internet connection and a login (vendor req
 
 | Command | What it does |
 | --- | --- |
-| `setup [INSTALLER.exe]` | Create the prefix, run the installer, find `JMStudio.exe`, add the menu entry. Looks in `~/Downloads` if no path is given. |
+| `install [--yes] [--installer FILE]` | The guided installer described above. |
+| `setup [--silent] [INSTALLER.exe]` | Only create the prefix, run the JMStudio installer, find `JMStudio.exe`, add the menu entry. Looks in `~/Downloads` if no path is given. |
 | `run [args]` | Start JMStudio (default command). |
 | `doctor` | Check Proton, container runtime, installation, camera fix, scanner USB access, GPUs. |
 | `udev` | Install `udev/70-3dmakerpro.rules` (asks for your password). |
@@ -76,7 +95,7 @@ The first start of JMStudio needs an internet connection and a login (vendor req
 | `winecfg`, `regedit`, `cmd` | Wine tools inside the prefix. |
 | `winetricks VERB...` | Run winetricks against the prefix. |
 | `logs` | Print the newest Proton log. |
-| `uninstall` | Remove the menu entry and, after asking, the whole prefix. |
+| `uninstall` | Remove the menu entry and launcher link, and after asking the USB rules, the whole prefix and the build cache. |
 
 Options: `--debug` (write a Proton log; set `WINEDEBUG` yourself for other channels), `--proton NAME|DIR`, `--runner auto|slr|proton|wine`.
 Environment: `JMSTUDIO_HOME` (default `~/.local/share/jmstudio-linux`), `JMSTUDIO_PROTON`, `JMSTUDIO_RUNNER`.
@@ -140,15 +159,18 @@ Mit diesem Repo läuft **JMStudio**, die Windows-Software für den **3DMakerpro 
 
 **Voraussetzungen:** Steam mit *Proton Experimental*, Vulkan-fähige GPU, `usbutils`, für den Kamera-Fix `clang`, `lld`, `flex`, `bison`, `gcc`, `make`, `patch`, `curl`; ein kostenloses JMMeta-Konto für den Download.
 
-**Schnellstart**
+**Installation in einem Schritt**
 
 ```bash
-git clone https://github.com/Ibot-11/jmstudio-linux.git
-cd jmstudio-linux
+curl -fsSL https://raw.githubusercontent.com/Ibot-11/jmstudio-linux/main/install.sh | bash
 ```
 
+Der Installer prüft Steam, Proton Experimental und die Build-Werkzeuge, öffnet die JMStudio-Download-Seite (der Download braucht ein kostenloses JMMeta-Konto und lässt sich nicht automatisieren) und wartet, bis die Datei in `~/Downloads` liegt. Dann installiert er JMStudio, setzt die USB-Rechte (ein Passwort-Dialog), baut den Kamera-Fix, legt den Menüeintrag an und führt `doctor` aus. Vor jedem Schritt, der dein System ändert, fragt er nach. Entfernen: `jmstudio-linux uninstall`.
+
+**Schritt für Schritt (manuell)**
+
 1. *JMStudio > Windows* von <https://forum.jimumeta.com/home/help/download.html> laden (Login nötig).
-2. Installieren: `./jmstudio-linux setup ~/Downloads/JMStudioSetup-*.exe` (am Ende JMStudio schließen, damit `setup` fertig wird)
+2. Installieren: `./jmstudio-linux setup --silent ~/Downloads/JMStudioSetup-*.exe`
 3. Einmalig USB-Rechte setzen (Passwort-Dialog): `./jmstudio-linux udev`
 4. Kamera-Fix installieren: `./jmstudio-linux camerafix`
 5. Scanner anstecken und prüfen: `./jmstudio-linux doctor`

@@ -2,10 +2,10 @@
 # jmstudio-linux - run 3DMakerpro JMStudio (Moose, Fox, ...) on Linux via Proton or Wine.
 #
 # JMStudio is proprietary and needs a JMMeta account to download, so this script
-# never fetches it: you give `setup` the installer you downloaded yourself.
+# never fetches it: `install` waits for the installer you download yourself.
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 DOWNLOAD_PAGE="https://forum.jimumeta.com/home/help/download.html"
 
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -21,6 +21,7 @@ CAMERAFIX_DIR="$JM_HOME/camerafix"  # patched Wine DLLs built by patches/build.s
 PROTON_NAME="${JMSTUDIO_PROTON:-Proton - Experimental}"
 RUNNER="${JMSTUDIO_RUNNER:-auto}"   # auto | slr | proton | wine
 DEBUG=0
+ASSUME_YES=0 GUIDED=0               # set by `install`
 
 SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT")"
@@ -43,7 +44,9 @@ jmstudio-linux $VERSION - run 3DMakerpro JMStudio on Linux
 Usage: jmstudio-linux [options] <command> [args]
 
 Commands:
-  setup [INSTALLER.exe]   create the prefix and run the JMStudio installer
+  install [--yes]         do everything: check requirements, install JMStudio, USB rules,
+                          camera fix, menu entry (--installer FILE: use this JMStudio installer)
+  setup [INSTALLER.exe]   only create the prefix and run the JMStudio installer
                           (--silent: unattended, --exe PATH: skip auto-detection)
   run [args]              start JMStudio (default command)
   doctor                  check Proton, USB access, GPU and the scanner
@@ -55,7 +58,7 @@ Commands:
   winecfg | regedit | cmd run the Wine tool inside the prefix
   winetricks VERB...      run winetricks against the prefix (e.g. vcrun2022)
   logs                    print the path of the newest Proton log
-  uninstall               remove the menu entry and (after asking) the prefix
+  uninstall               remove the menu entry, launcher link, and (after asking) USB rules and prefix
 
 Options:
   --debug                 write a Proton log to $LOG_DIR and enable USB/camera tracing
@@ -250,7 +253,26 @@ EOF
 		else warn "unknown installer type, ignoring --silent"; fi
 	fi
 	msg "running the installer (this also creates the prefix on first use)..."
-	run_in_prefix "$installer" "${flags[@]}" || warn "installer exited with an error, checking for an installation anyway"
+	if (( silent )); then
+		# The installer starts JMStudio when it is done and Proton waits for it to exit.
+		# Close that first start (only an instance that was not running before) so we can go on.
+		local before ipid pid
+		before=" $(pgrep -x JMStudio.exe | tr '\n' ' ' || true) "
+		run_in_prefix "$installer" "${flags[@]}" &
+		ipid=$!
+		while kill -0 "$ipid" 2>/dev/null; do
+			for pid in $(pgrep -x JMStudio.exe || true); do
+				[[ $before == *" $pid "* ]] && continue
+				before+="$pid "
+				sleep 3
+				kill -TERM "$pid" 2>/dev/null || true
+			done
+			sleep 2
+		done
+		wait "$ipid" || warn "installer exited with an error, checking for an installation anyway"
+	else
+		run_in_prefix "$installer" "${flags[@]}" || warn "installer exited with an error, checking for an installation anyway"
+	fi
 
 	if [[ -n $exe_arg ]]; then
 		save_exe "$exe_arg"
@@ -261,6 +283,7 @@ EOF
 	fi
 	msg "JMStudio: $EXE"
 	cmd_desktop
+	(( GUIDED )) && return 0
 	cat <<EOF
 
 Done. Next steps:
@@ -268,6 +291,7 @@ Done. Next steps:
   2. $SCRIPT camerafix        # patched Wine DLLs so JMStudio can find the scanner (builds them)
   3. $SCRIPT doctor
   4. $SCRIPT run
+(or let `$SCRIPT install` do all of this for you)
 EOF
 }
 
@@ -304,20 +328,25 @@ cmd_set_exe() {
 	msg "JMStudio: $EXE"
 }
 
-cmd_udev() {
-	local rules="$SCRIPT_DIR/udev/70-3dmakerpro.rules" dest="/etc/udev/rules.d/70-3dmakerpro.rules"
-	[[ -f $rules ]] || die "rules file missing: $rules"
-	# sudo needs a terminal; without one, polkit shows a graphical password dialog instead
-	local -a priv=()
-	if (( EUID != 0 )); then
-		if [[ -t 0 ]] && command -v sudo >/dev/null; then priv=(sudo)
-		elif command -v pkexec >/dev/null; then priv=(pkexec)
-		elif command -v sudo >/dev/null; then priv=(sudo)
-		else die "root is needed: install sudo or polkit (pkexec)"; fi
+# Run a command as root. sudo needs a terminal; without one, polkit shows a graphical
+# password dialog instead.
+as_root() {
+	if (( EUID == 0 )); then "$@"
+	elif [[ -t 0 ]] && command -v sudo >/dev/null; then sudo "$@"
+	elif command -v pkexec >/dev/null; then pkexec "$@"
+	elif command -v sudo >/dev/null; then sudo "$@"
+	else die "root is needed: install sudo or polkit (pkexec)"
 	fi
-	msg "installing $dest (${priv[0]:-as root})"
-	"${priv[@]}" sh -c 'install -m 644 "$1" "$2" && udevadm control --reload-rules && udevadm trigger --subsystem-match=usb --action=add' sh "$rules" "$dest"
-	msg "done - replug the scanner"
+}
+
+UDEV_RULES_DEST="/etc/udev/rules.d/70-3dmakerpro.rules"
+
+cmd_udev() {
+	local rules="$SCRIPT_DIR/udev/70-3dmakerpro.rules"
+	[[ -f $rules ]] || die "rules file missing: $rules"
+	msg "installing $UDEV_RULES_DEST"
+	as_root sh -c 'install -m 644 "$1" "$2" && udevadm control --reload-rules && udevadm trigger --subsystem-match=usb --action=add' sh "$rules" "$UDEV_RULES_DEST"
+	msg "done"
 }
 
 # Wine alone cannot show the scanner to JMStudio (see patches/): DirectShow reports no USB
@@ -407,9 +436,19 @@ cmd_logs() {
 cmd_uninstall() {
 	rm -f "$DATA_HOME/applications/jmstudio-linux.desktop"
 	msg "menu entry removed"
-	[[ -d $JM_HOME && $JM_HOME != / && $JM_HOME != "$HOME" ]] || return 0
-	local a; read -r -p "Delete $JM_HOME (prefix, logs, installed JMStudio)? [y/N] " a
-	[[ $a == [yY]* ]] && rm -rf -- "$JM_HOME" && msg "deleted $JM_HOME"
+	local link="${JMSTUDIO_BIN_DIR:-$HOME/.local/bin}/jmstudio-linux"
+	if [[ -L $link && "$(readlink -f "$link")" == "$SCRIPT" ]]; then rm -f "$link"; msg "removed $link"; fi
+	if [[ -f $UDEV_RULES_DEST ]] && ask "Remove the USB rules $UDEV_RULES_DEST (asks for your password)?" n; then
+		as_root sh -c 'rm -f "$1" && udevadm control --reload-rules' sh "$UDEV_RULES_DEST" && msg "USB rules removed"
+	fi
+	if [[ -d $JM_HOME && $JM_HOME != / && $JM_HOME != "$HOME" ]] && \
+	   ask "Delete $JM_HOME (the Proton prefix, logs, the installed JMStudio, the patched DLLs)?" n; then
+		rm -rf -- "$JM_HOME" && msg "deleted $JM_HOME"
+	fi
+	local cache="${XDG_CACHE_HOME:-$HOME/.cache}/jmstudio-linux"
+	if [[ -d $cache ]] && ask "Delete the build cache $cache (the Wine sources, about 600 MB)?" n; then
+		rm -rf -- "$cache" && msg "deleted $cache"
+	fi
 	return 0
 }
 
@@ -469,6 +508,206 @@ cmd_doctor() {
 	(( bad == 0 ))
 }
 
+# ---------------------------------------------------------------- guided install
+
+PROTON_APPID=1493710                # Steam app id of "Proton Experimental"
+BUILD_TOOLS=(clang lld-link flex bison gcc make patch curl tar xz)
+
+have_tty() { { : < /dev/tty; } 2>/dev/null; }
+
+# Yes/no question. Reads from the terminal even when this script came through a pipe
+# (curl ... | bash). --yes answers yes to everything; without a terminal the default wins.
+ask() {
+	local question="$1" default="${2:-y}" hint="[Y/n]" answer
+	[[ $default == n ]] && hint="[y/N]"
+	(( ASSUME_YES )) && return 0
+	have_tty || { [[ $default == y ]]; return; }
+	read -r -p "$question $hint " answer < /dev/tty || return 1
+	answer="${answer:-$default}"
+	[[ $answer == [yY]* ]]
+}
+
+step() { printf '\n\033[1m[%s/6] %s\033[0m\n' "$1" "$2"; }
+ok()   { printf '  \033[32mok\033[0m  %s\n' "$*"; }
+
+missing_tools() { local c; for c in "$@"; do command -v "$c" >/dev/null || printf '%s ' "$c"; done; }
+
+# The command that installs the camera fix's build tools on the common distributions.
+package_install_command() {
+	local id="" like=""
+	if [[ -r /etc/os-release ]]; then
+		id="$(. /etc/os-release; echo "${ID:-}")"
+		like="$(. /etc/os-release; echo "${ID_LIKE:-}")"
+	fi
+	case " $id $like " in
+		*" arch "*|*" cachyos "*|*" manjaro "*|*" endeavouros "*)
+			echo "sudo pacman -S --needed clang lld flex bison gcc make patch curl tar xz usbutils" ;;
+		*" debian "*|*" ubuntu "*)
+			echo "sudo apt install clang lld flex bison gcc make patch curl tar xz-utils usbutils" ;;
+		*" fedora "*|*" rhel "*)
+			echo "sudo dnf install clang lld flex bison gcc make patch curl tar xz usbutils" ;;
+		*" suse "*|*" opensuse-tumbleweed "*|*" opensuse-leap "*)
+			echo "sudo zypper install clang lld flex bison gcc make patch curl tar xz usbutils" ;;
+	esac
+}
+
+jmstudio_running() { pgrep -x JMStudio.exe >/dev/null; }
+
+# Step 1: Steam, Proton Experimental and the tools the camera fix is built with.
+install_requirements() {
+	local missing cmd n
+
+	[[ -n "$(steam_roots)" ]] || die "Steam was not found. Install Steam (your package manager or https://store.steampowered.com), start it once and log in, then run this installer again."
+	ok "Steam: $(steam_roots | head -1)"
+
+	if ! find_proton >/dev/null; then
+		warn "'$PROTON_NAME' is not installed in Steam yet."
+		[[ $PROTON_NAME == "Proton - Experimental" ]] || die "install '$PROTON_NAME' (or pick another with --proton) and run this installer again."
+		ask "Open Steam's install dialog for Proton Experimental now?" y \
+			|| die "install it in Steam (Library, show Tools, Proton Experimental) and run this installer again."
+		(steam "steam://install/$PROTON_APPID" || xdg-open "steam://install/$PROTON_APPID") >/dev/null 2>&1 &
+		msg "confirm the installation in Steam; waiting for it (Ctrl+C to cancel)..."
+		for ((n = 0; n < 400; n++)); do find_proton >/dev/null && break; sleep 3; done
+		find_proton >/dev/null || die "Proton Experimental did not show up in Steam within 20 minutes."
+	fi
+	PROTON_DIR="$(find_proton)"
+	ok "Proton: $(basename "$PROTON_DIR") ($(tr -d '\n' < "$PROTON_DIR/version" 2>/dev/null))"
+
+	# Steam installs the container runtime together with Proton; it may still be downloading.
+	for ((n = 0; n < 200; n++)); do find_slr_entry "$PROTON_DIR" >/dev/null && break; (( n == 0 )) && msg "waiting for Steam to finish downloading the Steam Linux Runtime..."; sleep 3; done
+	find_slr_entry "$PROTON_DIR" >/dev/null || warn "Steam Linux Runtime not found; Proton will run without its container"
+
+	missing="$(missing_tools "${BUILD_TOOLS[@]}")"
+	if [[ -n $missing ]]; then
+		warn "missing tools for the camera fix: $missing"
+		cmd="$(package_install_command)"
+		if [[ -n $cmd ]] && ask "Install them now with '$cmd'?" y; then
+			bash -c "$cmd" || die "installing the build tools failed"
+		else
+			die "install ${BUILD_TOOLS[*]} (${cmd:+for example: $cmd}) and run this installer again."
+		fi
+		missing="$(missing_tools "${BUILD_TOOLS[@]}")"
+		[[ -z $missing ]] || die "still missing: $missing"
+	fi
+	ok "build tools for the camera fix"
+	command -v lsusb >/dev/null || warn "lsusb (usbutils) is not installed; 'doctor' cannot list the scanner"
+}
+
+find_installer() {
+	find "$HOME/Downloads" "$HOME/Desktop" "$PWD" -maxdepth 2 -type f -iname 'JMStudioSetup*.exe' \
+		-printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true
+}
+
+# Step 2: JMStudio needs a (free) JMMeta login to download, so the user has to fetch it.
+install_get_installer() {
+	local f="${1:-}" size1 size2
+	if [[ -z $f ]]; then f="$(find_installer)"; fi
+	if [[ -n $f && -f $f ]]; then
+		ok "JMStudio installer: $f"
+		INSTALLER="$f"
+		return
+	fi
+	cat <<EOF
+  JMStudio is proprietary and can only be downloaded with a free JMMeta account, so this
+  installer cannot fetch it for you:
+    1. open $DOWNLOAD_PAGE
+    2. under "JMStudio" > "Windows" click Download (log in or sign up when asked)
+    3. save the file (JMStudioSetup-....exe) to ~/Downloads
+EOF
+	have_tty || die "no JMStudio installer found; download it as described above and run this installer again."
+	if command -v xdg-open >/dev/null && ask "Open that page in your browser now?" y; then
+		xdg-open "$DOWNLOAD_PAGE" >/dev/null 2>&1 || true
+	fi
+	msg "waiting for JMStudioSetup-*.exe in ~/Downloads (Ctrl+C to cancel)..."
+	until f="$(find_installer)"; [[ -n $f ]]; do sleep 3; done
+	# wait until the browser has finished writing it
+	size1=-1
+	while size2="$(stat -c %s "$f" 2>/dev/null || echo 0)"; [[ $size2 != "$size1" ]]; do size1=$size2; sleep 3; done
+	ok "JMStudio installer: $f"
+	INSTALLER="$f"
+}
+
+# Step 4: the scanner's cameras need USB write access for Wine.
+install_udev() {
+	local rules="$SCRIPT_DIR/udev/70-3dmakerpro.rules"
+	if cmp -s "$rules" "$UDEV_RULES_DEST" 2>/dev/null; then ok "USB rules already installed"; return; fi
+	echo "  The scanner's cameras need USB write access for Wine. This installs $UDEV_RULES_DEST"
+	echo "  and asks for your password."
+	if ask "Install the USB rules?" y; then cmd_udev
+	else warn "skipped - JMStudio will not find the scanner without them (later: jmstudio-linux udev)"; fi
+}
+
+# Put `jmstudio-linux` on the PATH (the menu entry points at the script itself).
+install_link() {
+	local bin="${JMSTUDIO_BIN_DIR:-$HOME/.local/bin}" link
+	link="$bin/jmstudio-linux"
+	mkdir -p "$bin"
+	if [[ ! -e $link || -L $link ]]; then ln -sf "$SCRIPT" "$link"; fi
+	case ":$PATH:" in *":$bin:"*) ;; *) warn "$bin is not in your PATH; run $SCRIPT or add that folder to PATH" ;; esac
+}
+
+cmd_install() {
+	local installer=""
+	while (( $# )); do
+		case $1 in
+			-y|--yes) ASSUME_YES=1 ;;
+			--installer) installer="${2:?--installer needs a file}"; shift ;;
+			*) die "unknown option for install: $1 (see --help)" ;;
+		esac
+		shift
+	done
+	GUIDED=1
+	cat <<EOF
+jmstudio-linux $VERSION installer
+
+This sets up JMStudio (3DMakerpro) for your scanner on Linux:
+  - a separate Proton prefix in $JM_HOME (Steam's games are not touched)
+  - JMStudio itself, from the installer you download
+  - USB permissions for the scanner (one password prompt)
+  - a small Wine fix so JMStudio can find the scanner (built from source, ~1 minute)
+  - an entry in your application menu
+EOF
+	ask "Continue?" y || exit 0
+
+	step 1 "Requirements"
+	install_requirements
+	resolve_runner
+	if jmstudio_running; then die "JMStudio is running. Close it and run this installer again."; fi
+
+	step 2 "JMStudio installer"
+	load_state
+	if [[ -n $EXE && -f $EXE ]] && [[ -z $installer ]]; then
+		ok "JMStudio is already installed: $EXE"
+		INSTALLER=""
+	else
+		install_get_installer "$installer"
+	fi
+
+	step 3 "Installing JMStudio"
+	if [[ -n ${INSTALLER:-} ]]; then
+		cmd_setup --silent "$INSTALLER"
+	else
+		ok "skipped (already installed)"
+	fi
+
+	step 4 "USB permissions"
+	install_udev
+
+	step 5 "Camera fix"
+	if camerafix_installed; then ok "already installed"; else camerafix_install; fi
+	install_link
+	cmd_desktop
+
+	step 6 "Check"
+	cmd_doctor || true
+	cat <<EOF
+
+Done. Plug the scanner in and start "JMStudio (3DMakerpro)" from your application menu
+(or run: jmstudio-linux run). The first start needs an internet connection and a login.
+Something wrong? Run: jmstudio-linux doctor
+EOF
+}
+
 # ---------------------------------------------------------------- main
 
 while (( $# )); do
@@ -484,7 +723,8 @@ done
 
 cmd="${1:-run}"; (( $# )) && shift
 case $cmd in
-	setup|install) cmd_setup "$@" ;;
+	install)       cmd_install "$@" ;;
+	setup)         cmd_setup "$@" ;;
 	run)           cmd_run "$@" ;;
 	doctor)        cmd_doctor ;;
 	udev)          cmd_udev ;;
