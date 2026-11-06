@@ -303,10 +303,16 @@ cmd_set_exe() {
 cmd_udev() {
 	local rules="$SCRIPT_DIR/udev/70-3dmakerpro.rules" dest="/etc/udev/rules.d/70-3dmakerpro.rules"
 	[[ -f $rules ]] || die "rules file missing: $rules"
-	msg "installing $dest (sudo)"
-	sudo install -m 644 "$rules" "$dest"
-	sudo udevadm control --reload-rules
-	sudo udevadm trigger --subsystem-match=usb --action=add
+	# sudo needs a terminal; without one, polkit shows a graphical password dialog instead
+	local -a priv=()
+	if (( EUID != 0 )); then
+		if [[ -t 0 ]] && command -v sudo >/dev/null; then priv=(sudo)
+		elif command -v pkexec >/dev/null; then priv=(pkexec)
+		elif command -v sudo >/dev/null; then priv=(sudo)
+		else die "root is needed: install sudo or polkit (pkexec)"; fi
+	fi
+	msg "installing $dest (${priv[0]:-as root})"
+	"${priv[@]}" sh -c 'install -m 644 "$1" "$2" && udevadm control --reload-rules && udevadm trigger --subsystem-match=usb --action=add' sh "$rules" "$dest"
 	msg "done - replug the scanner"
 }
 
