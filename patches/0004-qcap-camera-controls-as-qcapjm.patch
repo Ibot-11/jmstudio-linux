@@ -1,0 +1,308 @@
+--- a/dlls/qcap/qcap_private.h
++++ b/dlls/qcap/qcap_private.h
+@@ -107,6 +107,20 @@
+     LONGLONG                    *intervals;
+ };
+ 
++/* IAMCameraControl properties travel to the unix side in the same number space as the
++ * IAMVideoProcAmp ones, offset by QCAP_CAMERA_CONTROL_BASE. */
++#define QCAP_CAMERA_CONTROL_BASE 0x100
++enum qcap_camera_control
++{
++    QCAP_CAMERA_CONTROL_PAN,
++    QCAP_CAMERA_CONTROL_TILT,
++    QCAP_CAMERA_CONTROL_ROLL,
++    QCAP_CAMERA_CONTROL_ZOOM,
++    QCAP_CAMERA_CONTROL_EXPOSURE,
++    QCAP_CAMERA_CONTROL_IRIS,
++    QCAP_CAMERA_CONTROL_FOCUS,
++};
++
+ struct get_prop_range_params
+ {
+     video_capture_device_t       device;
+--- a/dlls/qcap/v4l.c
++++ b/dlls/qcap/v4l.c
+@@ -255,7 +255,7 @@
+     return S_OK;
+ }
+ 
+-static __u32 v4l2_cid_from_qcap_property(VideoProcAmpProperty property)
++static __u32 v4l2_cid_from_qcap_property(LONG property)
+ {
+     switch (property)
+     {
+@@ -267,8 +267,30 @@
+         return V4L2_CID_HUE;
+     case VideoProcAmp_Saturation:
+         return V4L2_CID_SATURATION;
++    case VideoProcAmp_Sharpness:
++        return V4L2_CID_SHARPNESS;
++    case VideoProcAmp_Gamma:
++        return V4L2_CID_GAMMA;
++    case VideoProcAmp_WhiteBalance:
++        return V4L2_CID_WHITE_BALANCE_TEMPERATURE;
++    case VideoProcAmp_BacklightCompensation:
++        return V4L2_CID_BACKLIGHT_COMPENSATION;
++    case VideoProcAmp_Gain:
++        return V4L2_CID_GAIN;
++    case QCAP_CAMERA_CONTROL_BASE + QCAP_CAMERA_CONTROL_PAN:
++        return V4L2_CID_PAN_ABSOLUTE;
++    case QCAP_CAMERA_CONTROL_BASE + QCAP_CAMERA_CONTROL_TILT:
++        return V4L2_CID_TILT_ABSOLUTE;
++    case QCAP_CAMERA_CONTROL_BASE + QCAP_CAMERA_CONTROL_ZOOM:
++        return V4L2_CID_ZOOM_ABSOLUTE;
++    case QCAP_CAMERA_CONTROL_BASE + QCAP_CAMERA_CONTROL_EXPOSURE:
++        return V4L2_CID_EXPOSURE_ABSOLUTE;
++    case QCAP_CAMERA_CONTROL_BASE + QCAP_CAMERA_CONTROL_IRIS:
++        return V4L2_CID_IRIS_ABSOLUTE;
++    case QCAP_CAMERA_CONTROL_BASE + QCAP_CAMERA_CONTROL_FOCUS:
++        return V4L2_CID_FOCUS_ABSOLUTE;
+     default:
+-        FIXME("Unhandled property %d.\n", property);
++        WARN("Unhandled property %d.\n", property);
+         return 0;
+     }
+ }
+@@ -279,7 +301,9 @@
+     struct video_capture_device *device = get_device(params->device);
+     struct v4l2_queryctrl ctrl;
+ 
++    memset(&ctrl, 0, sizeof(ctrl));
+     ctrl.id = v4l2_cid_from_qcap_property(params->property);
++    if (!ctrl.id) return E_PROP_ID_UNSUPPORTED;
+ 
+     if (xioctl(device->fd, VIDIOC_QUERYCTRL, &ctrl) == -1)
+     {
+@@ -302,6 +326,7 @@
+     struct v4l2_control ctrl;
+ 
+     ctrl.id = v4l2_cid_from_qcap_property(params->property);
++    if (!ctrl.id) return E_PROP_ID_UNSUPPORTED;
+ 
+     if (xioctl(device->fd, VIDIOC_G_CTRL, &ctrl) == -1)
+     {
+@@ -322,8 +347,16 @@
+     struct v4l2_control ctrl;
+ 
+     ctrl.id = v4l2_cid_from_qcap_property(params->property);
++    if (!ctrl.id) return E_PROP_ID_UNSUPPORTED;
+     ctrl.value = params->value;
+ 
++    if (ctrl.id == V4L2_CID_EXPOSURE_ABSOLUTE)
++    {
++        /* An absolute exposure only takes effect in manual mode; not all devices have the switch. */
++        struct v4l2_control mode = { .id = V4L2_CID_EXPOSURE_AUTO, .value = V4L2_EXPOSURE_MANUAL };
++        xioctl(device->fd, VIDIOC_S_CTRL, &mode);
++    }
++
+     if (xioctl(device->fd, VIDIOC_S_CTRL, &ctrl) == -1)
+     {
+         WARN("Failed to set property: %s\n", strerror(errno));
+--- a/dlls/qcap/vfwcapture.c
++++ b/dlls/qcap/vfwcapture.c
+@@ -31,6 +31,7 @@
+     IAMStreamConfig IAMStreamConfig_iface;
+     IAMVideoControl IAMVideoControl_iface;
+     IAMVideoProcAmp IAMVideoProcAmp_iface;
++    IAMCameraControl IAMCameraControl_iface;
+     IAMFilterMiscFlags IAMFilterMiscFlags_iface;
+     IPersistPropertyBag IPersistPropertyBag_iface;
+     BOOL init;
+@@ -65,6 +66,11 @@
+     return CONTAINING_RECORD(iface, struct vfw_capture, IAMVideoControl_iface);
+ }
+ 
++static inline struct vfw_capture *impl_from_IAMCameraControl(IAMCameraControl *iface)
++{
++    return CONTAINING_RECORD(iface, struct vfw_capture, IAMCameraControl_iface);
++}
++
+ static inline struct vfw_capture *impl_from_IAMVideoProcAmp(IAMVideoProcAmp *iface)
+ {
+     return CONTAINING_RECORD(iface, struct vfw_capture, IAMVideoProcAmp_iface);
+@@ -122,6 +128,8 @@
+         *out = &filter->IAMVideoControl_iface;
+     else if (IsEqualGUID(iid, &IID_IAMVideoProcAmp))
+         *out = &filter->IAMVideoProcAmp_iface;
++    else if (IsEqualGUID(iid, &IID_IAMCameraControl))
++        *out = &filter->IAMCameraControl_iface;
+     else if (IsEqualGUID(iid, &IID_IAMFilterMiscFlags))
+         *out = &filter->IAMFilterMiscFlags_iface;
+     else
+@@ -526,6 +534,150 @@
+     AMVideoProcAmp_Get,
+ };
+ 
++/* IAMCameraControl. Exposure is the one that matters most: DirectShow expresses it as log2 of
++ * the time in seconds, V4L2 as a count of 100 microsecond units, so convert like Windows' USB
++ * video driver does. Pan and tilt are in degrees here and in arc seconds in V4L2. */
++static LONG exposure_log2_floor(LONG units, BOOL *exact)
++{
++    LONGLONG u = units < 1 ? 1 : units;
++    LONG n;
++
++    if (u >= 10000)
++    {
++        for (n = 0; u >= (10000LL << (n + 1)); ++n) ;
++        *exact = u == (10000LL << n);
++    }
++    else
++    {
++        for (n = -1; (u << -n) < 10000; --n) ;
++        *exact = (u << -n) == 10000;
++    }
++    return n;
++}
++
++/* nearest power of two on a log scale, so that Set followed by Get gives the value back */
++static LONG exposure_log2_round(LONG units)
++{
++    LONGLONG u = units < 1 ? 1 : units;
++    BOOL exact;
++    LONG n = exposure_log2_floor(units, &exact);
++
++    if (n >= 0) return u * u >= 2 * (10000LL << n) * (10000LL << n) ? n + 1 : n;
++    return (u << -n) * (u << -n) >= 2 * 10000LL * 10000LL ? n + 1 : n;
++}
++
++static LONG exposure_units_from_log2(LONG value)
++{
++    if (value < -30) return 0;
++    if (value < 0) return (10000 + (1 << (-value - 1))) >> -value;
++    if (value > 17) return 0x7fffffff;
++    return 10000 << value;
++}
++
++static HRESULT WINAPI AMCameraControl_QueryInterface(IAMCameraControl *iface, REFIID iid, void **out)
++{
++    struct vfw_capture *filter = impl_from_IAMCameraControl(iface);
++    return IUnknown_QueryInterface(filter->filter.outer_unk, iid, out);
++}
++
++static ULONG WINAPI AMCameraControl_AddRef(IAMCameraControl *iface)
++{
++    struct vfw_capture *filter = impl_from_IAMCameraControl(iface);
++    return IUnknown_AddRef(filter->filter.outer_unk);
++}
++
++static ULONG WINAPI AMCameraControl_Release(IAMCameraControl *iface)
++{
++    struct vfw_capture *filter = impl_from_IAMCameraControl(iface);
++    return IUnknown_Release(filter->filter.outer_unk);
++}
++
++static HRESULT WINAPI AMCameraControl_GetRange(IAMCameraControl *iface, LONG property,
++        LONG *min, LONG *max, LONG *step, LONG *default_value, LONG *flags)
++{
++    struct vfw_capture *filter = impl_from_IAMCameraControl(iface);
++    struct get_prop_range_params params = { filter->device, QCAP_CAMERA_CONTROL_BASE + property,
++            min, max, step, default_value, flags };
++    BOOL exact;
++    HRESULT hr;
++
++    TRACE("filter %p, property %ld, min %p, max %p, step %p, default_value %p, flags %p.\n",
++            filter, property, min, max, step, default_value, flags);
++
++    if (!min || !max || !step || !default_value || !flags)
++        return E_POINTER;
++    if (property < 0 || property > QCAP_CAMERA_CONTROL_FOCUS)
++        return E_PROP_ID_UNSUPPORTED;
++    if (FAILED(hr = V4L_CALL( get_prop_range, &params )))
++        return hr;
++
++    if (property == QCAP_CAMERA_CONTROL_EXPOSURE)
++    {
++        /* the smallest and largest value must stay inside what the device accepts */
++        *min = exposure_log2_floor(*min, &exact) + (exact ? 0 : 1);
++        *max = exposure_log2_floor(*max, &exact);
++        *default_value = exposure_log2_floor(*default_value, &exact);
++        *step = 1;
++    }
++    else if (property == QCAP_CAMERA_CONTROL_PAN || property == QCAP_CAMERA_CONTROL_TILT)
++    {
++        *min = (*min + 3599) / 3600;
++        *max /= 3600;
++        *default_value /= 3600;
++        *step = max(1, *step / 3600);
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI AMCameraControl_Set(IAMCameraControl *iface, LONG property, LONG value, LONG flags)
++{
++    struct vfw_capture *filter = impl_from_IAMCameraControl(iface);
++    struct set_prop_params params = { filter->device, QCAP_CAMERA_CONTROL_BASE + property, value, flags };
++
++    TRACE("filter %p, property %ld, value %ld, flags %#lx.\n", filter, property, value, flags);
++
++    if (property < 0 || property > QCAP_CAMERA_CONTROL_FOCUS)
++        return E_PROP_ID_UNSUPPORTED;
++    if (property == QCAP_CAMERA_CONTROL_EXPOSURE)
++        params.value = exposure_units_from_log2(value);
++    else if (property == QCAP_CAMERA_CONTROL_PAN || property == QCAP_CAMERA_CONTROL_TILT)
++        params.value = value * 3600;
++
++    return V4L_CALL( set_prop, &params );
++}
++
++static HRESULT WINAPI AMCameraControl_Get(IAMCameraControl *iface, LONG property, LONG *value, LONG *flags)
++{
++    struct vfw_capture *filter = impl_from_IAMCameraControl(iface);
++    struct get_prop_params params = { filter->device, QCAP_CAMERA_CONTROL_BASE + property, value, flags };
++    HRESULT hr;
++
++    TRACE("filter %p, property %ld, value %p, flags %p.\n", filter, property, value, flags);
++
++    if (!value || !flags)
++        return E_POINTER;
++    if (property < 0 || property > QCAP_CAMERA_CONTROL_FOCUS)
++        return E_PROP_ID_UNSUPPORTED;
++    if (FAILED(hr = V4L_CALL( get_prop, &params )))
++        return hr;
++
++    if (property == QCAP_CAMERA_CONTROL_EXPOSURE)
++        *value = exposure_log2_round(*value);
++    else if (property == QCAP_CAMERA_CONTROL_PAN || property == QCAP_CAMERA_CONTROL_TILT)
++        *value /= 3600;
++    return S_OK;
++}
++
++static const IAMCameraControlVtbl IAMCameraControl_VTable =
++{
++    AMCameraControl_QueryInterface,
++    AMCameraControl_AddRef,
++    AMCameraControl_Release,
++    AMCameraControl_GetRange,
++    AMCameraControl_Set,
++    AMCameraControl_Get,
++};
++
+ static HRESULT WINAPI PPB_QueryInterface(IPersistPropertyBag *iface, REFIID iid, void **out)
+ {
+     struct vfw_capture *filter = impl_from_IPersistPropertyBag(iface);
+@@ -922,6 +1074,7 @@
+     object->IAMStreamConfig_iface.lpVtbl = &IAMStreamConfig_VTable;
+     object->IAMVideoControl_iface.lpVtbl = &IAMVideoControl_VTable;
+     object->IAMVideoProcAmp_iface.lpVtbl = &IAMVideoProcAmp_VTable;
++    object->IAMCameraControl_iface.lpVtbl = &IAMCameraControl_VTable;
+     object->IAMFilterMiscFlags_iface.lpVtbl = &IAMFilterMiscFlags_VTable;
+     object->IPersistPropertyBag_iface.lpVtbl = &IPersistPropertyBag_VTable;
+ 
+--- a/dlls/qcap/Makefile.in
++++ b/dlls/qcap/Makefile.in
+@@ -1,5 +1,5 @@
+-MODULE    = qcap.dll
+-UNIXLIB   = qcap.so
++MODULE    = qcapjm.dll
++UNIXLIB   = qcapjm.so
+ IMPORTS   = strmbase strmiids uuid ole32 oleaut32 winmm msvcrt
+ DELAYIMPORTS = msvfw32
+ 
+--- /dev/null
++++ b/dlls/qcap/qcapjm.spec
+@@ -0,0 +1,4 @@
++@ stdcall -private DllCanUnloadNow()
++@ stdcall -private DllGetClassObject(ptr ptr ptr)
++@ stdcall -private DllRegisterServer()
++@ stdcall -private DllUnregisterServer()

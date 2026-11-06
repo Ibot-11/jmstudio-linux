@@ -7,9 +7,15 @@
 #                      (JMStudio's Moose module parses vid_/&mi_ out of it)
 #   mf.dll       0002: Media Foundation lists the cameras (Qt's camera list, which JMStudio
 #                      uses to find the scanner's serial number, is empty without it)
+#   qcapjm       0004: the camera filter gets IAMCameraControl and more V4L2 controls (exposure,
+#                      gain, ...). JMStudio sets the scanner's LED brightness through the
+#                      camera's exposure. Built as a renamed copy (qcapjm.dll + qcapjm.so),
+#                      because the Linux half cannot replace Proton's own qcap.so.
 #
-# Both are built from the Wine 11.0 release sources with clang; nothing is installed.
-# Needs: clang, lld, flex, bison, gcc, make, patch, curl, tar, xz.
+# All are built from the Wine 11.0 release sources with clang; nothing is installed.
+# Output: devenum.dll, mf.dll and overlay/{x86_64-windows/qcapjm.dll,x86_64-unix/qcapjm.so}.
+# Needs: clang, lld, flex, bison, gcc, make, patch, curl, tar, xz and the kernel headers
+# (linux/videodev2.h).
 # Usage: build.sh [OUTPUT_DIR]      (default: ./camerafix-build-out)
 set -euo pipefail
 
@@ -30,6 +36,7 @@ msg() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 for c in clang lld-link flex bison gcc make patch curl tar xz sha256sum; do
 	command -v "$c" >/dev/null || die "missing build tool: $c"
 done
+[[ -f /usr/include/linux/videodev2.h ]] || die "missing the kernel headers (linux/videodev2.h): install linux-api-headers (Arch) or linux-libc-dev (Debian/Ubuntu)"
 
 mkdir -p "$WORK" "$OUT"
 TARBALL="$WORK/wine-$WINE_VERSION.tar.xz"
@@ -52,13 +59,17 @@ cd "$WORK/build"
 "$SRC/configure" --enable-archs=x86_64 --with-mingw=clang --disable-tests --without-x --without-wayland \
 	--without-alsa --without-pulse --without-oss --without-cups --without-sane --without-gphoto \
 	--without-pcap --without-krb5 --without-gstreamer --without-ffmpeg --without-vulkan \
-	--without-opencl --without-usb --without-v4l2 --without-udev --without-sdl > configure.log 2>&1 \
+	--without-opencl --without-usb --without-udev --without-sdl > configure.log 2>&1 \
 	|| die "configure failed, see $WORK/build/configure.log"
 
-msg "building ${DLLS[*]}"
-targets=()
+msg "building ${DLLS[*]} qcapjm"
+targets=(dlls/qcap/x86_64-windows/qcapjm.dll dlls/qcap/qcapjm.so)
 for d in "${DLLS[@]}"; do targets+=("dlls/$d/x86_64-windows/$d.dll"); done
 make -j"$(nproc)" "${targets[@]}" > make.log 2>&1 || die "build failed, see $WORK/build/make.log"
 
 for d in "${DLLS[@]}"; do cp "dlls/$d/x86_64-windows/$d.dll" "$OUT/$d.dll"; done
-msg "built ${DLLS[*]} in $OUT"
+rm -rf "$OUT/overlay"
+mkdir -p "$OUT/overlay/x86_64-windows" "$OUT/overlay/x86_64-unix"
+cp dlls/qcap/x86_64-windows/qcapjm.dll "$OUT/overlay/x86_64-windows/"
+cp dlls/qcap/qcapjm.so "$OUT/overlay/x86_64-unix/"
+msg "built ${DLLS[*]} and the qcapjm overlay in $OUT"

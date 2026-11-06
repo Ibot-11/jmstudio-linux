@@ -1,14 +1,15 @@
 --- a/dlls/devenum/createdevenum.c
 +++ b/dlls/devenum/createdevenum.c
-@@ -711,9 +711,113 @@
+@@ -711,9 +711,73 @@
      }
  }
  
 +/* Applications identify USB cameras by the DevicePath that Windows reports,
 + *   \\?\usb#vid_xxxx&pid_xxxx[&mi_xx]#<instance>#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global
-+ * which carries the vendor and product ID. A v4l2 node has none of that, so find
-+ * the USB device that owns /dev/videoN in sysfs and build the same string. */
-+#define SYSFS_USB_DEVICES L"Z:\\sys\\bus\\usb\\devices"
++ * which carries the vendor and product ID. A v4l2 node has none of that, so read it from the
++ * USB interface that provides /dev/videoN: its sysfs "modalias" holds the IDs and the device
++ * class, e.g. "usb:v0BCDp000Ad0009dcEFdsc02dp01ic0Eisc01ip00in00". */
++#define SYSFS_VIDEO4LINUX L"Z:\\sys\\class\\video4linux"
 +
 +static BOOL read_sysfs_attr(const WCHAR *dir, const WCHAR *name, char *buf, DWORD size)
 +{
@@ -27,79 +28,38 @@
 +    return len != 0;
 +}
 +
-+/* Find the USB device and interface directory in sysfs that provide /dev/video<index>. */
-+static BOOL find_usb_video_device(unsigned int index, WCHAR *dev_dir, WCHAR *dev_name, WCHAR *if_name)
-+{
-+    WCHAR pattern[MAX_PATH], path[MAX_PATH];
-+    WIN32_FIND_DATAW dev_data, if_data;
-+    HANDLE dev_find, if_find;
-+    BOOL found = FALSE;
-+
-+    dev_find = FindFirstFileW(SYSFS_USB_DEVICES L"\\*", &dev_data);
-+    if (dev_find == INVALID_HANDLE_VALUE) return FALSE;
-+
-+    do
-+    {
-+        /* interfaces are listed here too, as "<device>:<config>.<interface>" */
-+        if (dev_data.cFileName[0] == '.' || wcschr(dev_data.cFileName, ':')) continue;
-+
-+        swprintf(dev_dir, MAX_PATH, SYSFS_USB_DEVICES L"\\%ls", dev_data.cFileName);
-+        swprintf(pattern, ARRAY_SIZE(pattern), L"%ls\\%ls:*", dev_dir, dev_data.cFileName);
-+        if ((if_find = FindFirstFileW(pattern, &if_data)) == INVALID_HANDLE_VALUE) continue;
-+
-+        do
-+        {
-+            swprintf(path, ARRAY_SIZE(path), L"%ls\\%ls\\video4linux\\video%u", dev_dir, if_data.cFileName, index);
-+            if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
-+            {
-+                lstrcpyW(dev_name, dev_data.cFileName);
-+                lstrcpyW(if_name, if_data.cFileName);
-+                found = TRUE;
-+            }
-+        } while (!found && FindNextFileW(if_find, &if_data));
-+        FindClose(if_find);
-+    } while (!found && FindNextFileW(dev_find, &dev_data));
-+
-+    FindClose(dev_find);
-+    return found;
-+}
-+
 +static BOOL get_usb_device_path(unsigned int index, WCHAR *device_path, size_t len)
 +{
-+    WCHAR dev_dir[MAX_PATH], dev_name[MAX_PATH], if_name[MAX_PATH], if_dir[MAX_PATH];
-+    char vid[8], pid[8], serial[64] = "", cls[8], subcls[8], proto[8], iface[8];
-+    BOOL composite;
++    char modalias[96], iface[8], vid[5], pid[5];
++    WCHAR dir[MAX_PATH];
 +    UINT32 hash = 2166136261u;
-+    const char *p;
-+    const WCHAR *w;
++    BOOL composite;
++    unsigned int i;
 +
-+    if (!find_usb_video_device(index, dev_dir, dev_name, if_name)) return FALSE;
-+
-+    swprintf(if_dir, ARRAY_SIZE(if_dir), L"%ls\\%ls", dev_dir, if_name);
-+    if (!read_sysfs_attr(dev_dir, L"idVendor", vid, sizeof(vid)) ||
-+        !read_sysfs_attr(dev_dir, L"idProduct", pid, sizeof(pid)) ||
-+        !read_sysfs_attr(if_dir, L"bInterfaceNumber", iface, sizeof(iface)))
++    swprintf(dir, ARRAY_SIZE(dir), SYSFS_VIDEO4LINUX L"\\video%u\\device", index);
++    if (!read_sysfs_attr(dir, L"modalias", modalias, sizeof(modalias))
++            || !read_sysfs_attr(dir, L"bInterfaceNumber", iface, sizeof(iface)))
 +        return FALSE;
-+    read_sysfs_attr(dev_dir, L"serial", serial, sizeof(serial));
++
++    for (i = 0; modalias[i]; i++) modalias[i] = tolower(modalias[i]);
++    if (strlen(modalias) < 32 || memcmp(modalias, "usb:v", 5) || modalias[9] != 'p' || modalias[14] != 'd'
++            || memcmp(modalias + 19, "dc", 2) || memcmp(modalias + 23, "dsc", 3) || memcmp(modalias + 28, "dp", 2))
++        return FALSE;
++    memcpy(vid, modalias + 5, 4); vid[4] = 0;
++    memcpy(pid, modalias + 10, 4); pid[4] = 0;
 +
 +    /* Windows puts a device with an interface association descriptor (or several
 +     * interfaces and no class) behind usbccgp, which adds "&mi_xx" to the path. */
-+    composite = FALSE;
-+    if (read_sysfs_attr(dev_dir, L"bDeviceClass", cls, sizeof(cls)) &&
-+        read_sysfs_attr(dev_dir, L"bDeviceSubClass", subcls, sizeof(subcls)) &&
-+        read_sysfs_attr(dev_dir, L"bDeviceProtocol", proto, sizeof(proto)))
-+        composite = !strcmp(cls, "ef") && !strcmp(subcls, "02") && !strcmp(proto, "01");
++    composite = !memcmp(modalias + 21, "ef", 2) && !memcmp(modalias + 26, "02", 2) && !memcmp(modalias + 30, "01", 2);
 +
-+    /* the instance id is an opaque hash on Windows; derive a stable one from the port path and serial */
-+    for (w = dev_name; *w; w++) hash = (hash ^ *w) * 16777619u;
-+    for (p = serial; *p; p++) hash = (hash ^ (UINT8)*p) * 16777619u;
++    /* the instance id is an opaque hash on Windows; derive a stable one that differs per camera */
++    for (i = 0; vid[i]; i++) hash = (hash ^ (UINT8)vid[i]) * 16777619u;
++    for (i = 0; pid[i]; i++) hash = (hash ^ (UINT8)pid[i]) * 16777619u;
++    hash = (hash ^ index) * 16777619u;
 +
 +    if (composite)
 +        swprintf(device_path, len, L"\\\\?\\usb#vid_%hs&pid_%hs&mi_%hs#6&%08x&0&%04x#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
 +                vid, pid, iface, hash, (unsigned int)strtoul(iface, NULL, 16));
-+    else if (serial[0])
-+        swprintf(device_path, len, L"\\\\?\\usb#vid_%hs&pid_%hs#%hs#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
-+                vid, pid, serial);
 +    else
 +        swprintf(device_path, len, L"\\\\?\\usb#vid_%hs&pid_%hs#6&%08x&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
 +                vid, pid, hash);
@@ -115,7 +75,7 @@
      IPropertyBag *prop_bag = NULL;
      REGFILTERPINS2 rgpins = {0};
      REGPINTYPES rgtypes;
-@@ -753,7 +857,8 @@
+@@ -753,7 +817,8 @@
          V_I4(&var) = i;
          IPropertyBag_Write(prop_bag, L"VFWIndex", &var);
  

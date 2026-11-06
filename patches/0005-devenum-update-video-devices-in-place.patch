@@ -1,0 +1,61 @@
+--- a/dlls/devenum/createdevenum.c
++++ b/dlls/devenum/createdevenum.c
+@@ -775,6 +775,22 @@
+     return TRUE;
+ }
+ 
++/* Every enumeration used to wipe the device list in the registry and rebuild it, so a thread
++ * listing the cameras while another one did the same (or while the list was being walked by a
++ * caller that parses a moniker's display name) could see no camera at all. Video capture
++ * devices are now updated in place: existing keys stay, only values are rewritten and keys of
++ * devices that are gone are removed. */
++static SRWLOCK video_devices_lock = SRWLOCK_INIT;
++
++static void remove_video_device(int index)
++{
++    WCHAR guidstr[CHARS_IN_GUID], path[MAX_PATH];
++
++    StringFromGUID2(&CLSID_VideoInputDeviceCategory, guidstr, ARRAY_SIZE(guidstr));
++    swprintf(path, ARRAY_SIZE(path), L"Software\\Microsoft\\ActiveMovie\\devenum\\%ls\\video%d", guidstr, index);
++    RegDeleteTreeW(HKEY_CURRENT_USER, path);
++}
++
+ static void register_avicap_devices(void)
+ {
+     WCHAR friendlyname[32], version[32], device_path[MAX_PATH];
+@@ -787,11 +803,16 @@
+     HRESULT hr;
+     int i = 0;
+ 
++    AcquireSRWLockExclusive(&video_devices_lock);
++
+     for (i = 0; i < 10; ++i)
+     {
+         if (!capGetDriverDescriptionW(i, friendlyname, ARRAY_SIZE(friendlyname),
+                 version, ARRAY_SIZE(version)))
++        {
++            remove_video_device(i);
+             continue;
++        }
+ 
+         swprintf(name, ARRAY_SIZE(name), L"video%d", i);
+ 
+@@ -826,6 +847,8 @@
+         VariantClear(&var);
+         IPropertyBag_Release(prop_bag);
+     }
++
++    ReleaseSRWLockExclusive(&video_devices_lock);
+ }
+ 
+ static HRESULT WINAPI devenum_factory_CreateClassEnumerator(ICreateDevEnum *iface,
+@@ -842,7 +865,8 @@
+ 
+     *out = NULL;
+ 
+-    if (!RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\ActiveMovie\\devenum", &key))
++    if (!IsEqualGUID(class, &CLSID_VideoInputDeviceCategory)
++            && !RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\ActiveMovie\\devenum", &key))
+     {
+         StringFromGUID2(class, guidstr, ARRAY_SIZE(guidstr));
+         RegDeleteTreeW(key, guidstr);

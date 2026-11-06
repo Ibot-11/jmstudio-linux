@@ -55,7 +55,7 @@ Commands:
                           build | install (default) | remove | status
   desktop                 (re)create the application menu entry
   set-exe PATH            tell the launcher where JMStudio.exe is
-  winecfg | regedit | cmd run the Wine tool inside the prefix
+  winecfg | regedit | cmd | reg   run the Wine tool inside the prefix
   winetricks VERB...      run winetricks against the prefix (e.g. vcrun2022)
   logs                    print the path of the newest Proton log
   uninstall               remove the menu entry, launcher link, and (after asking) USB rules and prefix
@@ -162,6 +162,11 @@ run_in_prefix() {
 	mkdir -p "$PREFIX_DIR" "$LOG_DIR"
 	# shellcheck disable=SC1090
 	[[ -f $USER_ENV ]] && source "$USER_ENV"
+	# The camera fix's renamed qcap (qcapjm.dll + qcapjm.so) lives outside Proton; Proton appends
+	# this WINEDLLPATH to its own so the loader finds it.
+	if [[ -d $CAMERAFIX_DIR/overlay/x86_64-unix ]]; then
+		export WINEDLLPATH="$CAMERAFIX_DIR/overlay${WINEDLLPATH:+:$WINEDLLPATH}"
+	fi
 	# Proton only writes a log when SteamGameId is set; the id itself is arbitrary here
 	export SteamGameId="${SteamGameId:-jmstudio}"
 	if (( DEBUG )); then
@@ -349,11 +354,15 @@ cmd_udev() {
 	msg "done"
 }
 
-# Wine alone cannot show the scanner to JMStudio (see patches/): DirectShow reports no USB
-# vendor/product ID for cameras (devenum.dll), and Media Foundation lists no cameras at all
-# (mf.dll). The camera fix puts patched builds of both into this prefix. They replace the
-# prefix's copies (symlinks into Proton), so Proton itself stays untouched.
+# Wine alone cannot show the scanner to JMStudio or let it dim the LEDs (see patches/): DirectShow
+# reports no USB vendor/product ID for cameras (devenum.dll), Media Foundation lists no cameras
+# (mf.dll), and the camera filter has no exposure control (qcap). The camera fix puts patched
+# builds into this prefix: devenum.dll and mf.dll replace the prefix's copies (symlinks into
+# Proton), and qcapjm (a renamed qcap) is added next to them and registered for the camera
+# filter's class. Proton itself stays untouched.
 CAMERAFIX_DLLS=(devenum mf)
+QCAP_CLSID='{1B544C22-FD0B-11CE-8C63-00AA0044B51E}'   # "VFW Capture Filter"
+QCAP_KEY='HKLM\Software\Classes\CLSID\'"$QCAP_CLSID"'\InprocServer32'
 
 camerafix_target() { echo "$(wine_prefix)/drive_c/windows/system32/$1.dll"; }
 
@@ -364,12 +373,13 @@ camerafix_installed() {
 		t="$(camerafix_target "$d")"
 		[[ -f $t && ! -L $t && ( -e $t.orig || -L $t.orig ) ]] || return 1
 	done
+	[[ -f $CAMERAFIX_DIR/overlay/x86_64-unix/qcapjm.so && -f "$(camerafix_target qcapjm)" ]]
 }
 
 camerafix_install() {
 	local d t
 	for d in "${CAMERAFIX_DLLS[@]}"; do
-		if [[ ! -f $CAMERAFIX_DIR/$d.dll ]]; then
+		if [[ ! -f $CAMERAFIX_DIR/$d.dll || ! -f $CAMERAFIX_DIR/overlay/x86_64-unix/qcapjm.so ]]; then
 			msg "building the patched DLLs"
 			"$SCRIPT_DIR/patches/build.sh" "$CAMERAFIX_DIR"
 			break
@@ -385,6 +395,11 @@ camerafix_install() {
 		head -c 16 /dev/zero | dd of="$t" bs=1 seek=64 conv=notrunc status=none
 		run_in_prefix reg add 'HKCU\Software\Wine\DllOverrides' /v "$d" /d 'native,builtin' /f
 	done
+	# qcapjm: a renamed qcap. Its Linux half is found through WINEDLLPATH (see run_in_prefix);
+	# the camera filter's class is pointed at it.
+	t="$(camerafix_target qcapjm)"
+	cp --remove-destination "$CAMERAFIX_DIR/overlay/x86_64-windows/qcapjm.dll" "$t"
+	run_in_prefix reg add "$QCAP_KEY" /ve /d 'C:\windows\system32\qcapjm.dll' /f
 	msg "camera fix installed - restart JMStudio"
 }
 
@@ -398,6 +413,8 @@ camerafix_remove() {
 			mv "$t.orig" "$t"
 		fi
 	done
+	run_in_prefix reg add "$QCAP_KEY" /ve /d 'C:\windows\system32\qcap.dll' /f || true
+	rm -f "$(camerafix_target qcapjm)"
 	msg "original Wine DLLs restored"
 }
 
@@ -472,7 +489,7 @@ cmd_doctor() {
 	echo "JMStudio"
 	load_state
 	if [[ -n $EXE && -f $EXE ]]; then pass "installed: $EXE"; else fail "not set up - run: jmstudio-linux setup"; fi
-	if camerafix_installed; then pass "camera fix (patched devenum.dll and mf.dll) installed"
+	if camerafix_installed; then pass "camera fix (patched devenum.dll, mf.dll and qcapjm) installed"
 	else fail "camera fix missing - JMStudio cannot find the scanner. Run: $SCRIPT camerafix"; fi
 
 	echo "Scanner (USB)"
@@ -541,13 +558,13 @@ package_install_command() {
 	fi
 	case " $id $like " in
 		*" arch "*|*" cachyos "*|*" manjaro "*|*" endeavouros "*)
-			echo "sudo pacman -S --needed clang lld flex bison gcc make patch curl tar xz usbutils" ;;
+			echo "sudo pacman -S --needed clang lld flex bison gcc make patch curl tar xz usbutils linux-api-headers" ;;
 		*" debian "*|*" ubuntu "*)
-			echo "sudo apt install clang lld flex bison gcc make patch curl tar xz-utils usbutils" ;;
+			echo "sudo apt install clang lld flex bison gcc make patch curl tar xz-utils usbutils linux-libc-dev" ;;
 		*" fedora "*|*" rhel "*)
-			echo "sudo dnf install clang lld flex bison gcc make patch curl tar xz usbutils" ;;
+			echo "sudo dnf install clang lld flex bison gcc make patch curl tar xz usbutils kernel-headers" ;;
 		*" suse "*|*" opensuse-tumbleweed "*|*" opensuse-leap "*)
-			echo "sudo zypper install clang lld flex bison gcc make patch curl tar xz usbutils" ;;
+			echo "sudo zypper install clang lld flex bison gcc make patch curl tar xz usbutils linux-glibc-devel" ;;
 	esac
 }
 
@@ -578,6 +595,7 @@ install_requirements() {
 	find_slr_entry "$PROTON_DIR" >/dev/null || warn "Steam Linux Runtime not found; Proton will run without its container"
 
 	missing="$(missing_tools "${BUILD_TOOLS[@]}")"
+	[[ -f /usr/include/linux/videodev2.h ]] || missing+="linux-headers "
 	if [[ -n $missing ]]; then
 		warn "missing tools for the camera fix: $missing"
 		cmd="$(package_install_command)"
@@ -587,6 +605,7 @@ install_requirements() {
 			die "install ${BUILD_TOOLS[*]} (${cmd:+for example: $cmd}) and run this installer again."
 		fi
 		missing="$(missing_tools "${BUILD_TOOLS[@]}")"
+		[[ -f /usr/include/linux/videodev2.h ]] || missing+="linux-headers "
 		[[ -z $missing ]] || die "still missing: $missing"
 	fi
 	ok "build tools for the camera fix"
@@ -731,7 +750,7 @@ case $cmd in
 	camerafix)     cmd_camerafix "$@" ;;
 	desktop)       cmd_desktop ;;
 	set-exe)       cmd_set_exe "$@" ;;
-	winecfg|regedit|cmd) cmd_tool "$cmd" "$@" ;;
+	winecfg|regedit|cmd|reg) cmd_tool "$cmd" "$@" ;;
 	winetricks)    cmd_winetricks "$@" ;;
 	logs)          cmd_logs ;;
 	uninstall)     cmd_uninstall ;;

@@ -14,9 +14,11 @@ JMStudio installs, starts, and with the camera fix it **recognises and connects 
 | --- | --- |
 | Proton Experimental prefix, `setup`, `run`, logs, menu entry | works (CachyOS, Proton Experimental 11.0 / Wine 11.0, JMStudio 2.6.17) |
 | USB access (`udev` rules) | works, tested with a Moose (`bcdc:000a`, `bcdc:000b`) |
-| **Camera fix** (patched Wine `devenum.dll` and `mf.dll`) | JMStudio finds the scanner's serial number, switches from the default "CR-Scan Lizard" to **Moose**, loads `moosePlugin.dll`, finds both cameras and logs `Connect scanner successfully` |
+| **Camera fix** (patched Wine `devenum.dll`, `mf.dll` and a camera filter `qcapjm`) | JMStudio finds the scanner's serial number, switches from the default "CR-Scan Lizard" to **Moose**, loads `moosePlugin.dll`, finds both cameras and logs `Connect scanner successfully` |
 | Camera capture | works in a test program using JMStudio's own OpenCV: both cameras open through DirectShow and deliver frames |
-| Live preview and scanning in JMStudio | **not verified yet** (the projector and camera settings may need more than Wine provides) |
+| Live preview | works (about 10-11 FPS, which is what the scanner's cameras deliver) |
+| LED brightness (JMStudio's "Bright level") | wired up: JMStudio sets the cameras' exposure, which is what drives the LEDs, and Wine now passes it on (checked with a test program: exposure -13 gives V4L2 exposure 1). Please report how it behaves in the program |
+| Scanning | **not verified yet** |
 
 Without the camera fix JMStudio never identifies the scanner at all, so it is a required step.
 
@@ -90,6 +92,7 @@ The first start of JMStudio needs an internet connection and a login (vendor req
 | `doctor` | Check Proton, container runtime, installation, camera fix, scanner USB access, GPUs. |
 | `udev` | Install `udev/70-3dmakerpro.rules` (asks for your password). |
 | `camerafix [build\|install\|remove\|status]` | Build and install, or remove, the patched Wine DLLs (default: install). |
+| `reg ...` | Run Windows' `reg.exe` in the prefix. |
 | `desktop` | Recreate the application menu entry. |
 | `set-exe PATH` | Point the launcher at `JMStudio.exe` if auto-detection fails. |
 | `winecfg`, `regedit`, `cmd` | Wine tools inside the prefix. |
@@ -103,13 +106,15 @@ Extra variables for JMStudio go into `~/.config/jmstudio-linux/env` as `export N
 
 ## What the camera fix does and why
 
-The Moose is two UVC cameras behind a USB hub. JMStudio finds it by looking at Windows' camera names and device IDs: it asks Qt for the camera list and derives the scanner's serial number (for example `JMM3004751`) from it, which decides the device plugin; the Moose module then lists the DirectShow cameras again and reads the USB vendor and product ID from each camera's **display name**. Stock Wine breaks this in three places:
+The Moose is two UVC cameras behind a USB hub. JMStudio finds it by looking at Windows' camera names and device IDs: it asks Qt for the camera list and derives the scanner's serial number (for example `JMM3004751`) from it, which decides the device plugin; the Moose module then lists the DirectShow cameras again and reads the USB vendor and product ID from each camera's **display name**. Stock Wine breaks this in several places:
 
 1. **DirectShow reports a fake `DevicePath`.** Wine's `devenum.dll` reports every camera as `dummy_video0`. Windows reports `\\?\usb#vid_bcdc&pid_000a&mi_00#...`. [`patches/0001-devenum-usb-device-path.patch`](patches/0001-devenum-usb-device-path.patch) builds that path from sysfs.
 2. **The camera's display name has no USB ID.** Wine names the camera `@device:cm:{860BB310-...}\video0`; Windows names it `@device:pnp:\\?\usb#vid_...`, and JMStudio parses `vid_` and `&mi_` out of that. [`patches/0003-devenum-pnp-display-name.patch`](patches/0003-devenum-pnp-display-name.patch) fixes the name (and makes `MkParseDisplayName` accept it).
-3. **Media Foundation lists no cameras.** Qt 6.2's camera list uses `MFEnumDeviceSources`, which Wine answers with "Not implemented for video capture devices". [`patches/0002-mf-enumerate-video-capture-devices.patch`](patches/0002-mf-enumerate-video-capture-devices.patch) enumerates the cameras (through the same DirectShow list). Capture itself is not implemented there; activating a camera returns a source that refuses every request, which Qt handles gracefully.
+3. **The camera filter cannot set exposure.** JMStudio dims the scanner's LEDs through the cameras' exposure time (the LEDs are pulsed with it; the default 60 is the maximum, so without this they stay at full brightness). It sets it through DirectShow's `IAMCameraControl`, which Wine's `qcap` does not implement, and Wine only maps four `IAMVideoProcAmp` properties. [`patches/0004-qcap-camera-controls-as-qcapjm.patch`](patches/0004-qcap-camera-controls-as-qcapjm.patch) adds `IAMCameraControl` (exposure with Windows' log2-seconds scale, pan, tilt, zoom, focus, iris) and the missing `IAMVideoProcAmp` properties (gain, sharpness, gamma, white balance, backlight). The Linux half of `qcap` cannot be replaced from outside Proton, so the patched filter is built as a renamed copy, `qcapjm.dll` + `qcapjm.so`: it is found through `WINEDLLPATH` (set by the launcher) and registered for the camera filter's class in the prefix.
+4. **Listing the cameras is not safe to do twice at once.** Wine's `devenum` wiped the camera list in the registry and rebuilt it on every enumeration. JMStudio opens both cameras from two threads (and parses display names while it is walking the list), so every now and then one thread saw no camera, and a camera was missing after the scanner had been stopped and started again (second scan: connected, but 0 frames per second). [`patches/0005-devenum-update-video-devices-in-place.patch`](patches/0005-devenum-update-video-devices-in-place.patch) updates the entries in place, removes only cameras that are really gone and serializes the update. With two threads listing 200 times each, stock Wine returned too few cameras in about 12% of the listings; with the fix, never. The sysfs lookup in patch 0001 reads one `modalias` file per camera instead of scanning all USB devices.
+5. **Media Foundation lists no cameras.** Qt 6.2's camera list uses `MFEnumDeviceSources`, which Wine answers with "Not implemented for video capture devices". [`patches/0002-mf-enumerate-video-capture-devices.patch`](patches/0002-mf-enumerate-video-capture-devices.patch) enumerates the cameras (through the same DirectShow list). Capture itself is not implemented there; activating a camera returns a source that refuses every request, which Qt handles gracefully.
 
-`jmstudio-linux camerafix` builds both DLLs from the signed Wine 11.0 release sources (SHA-256 pinned) with `clang`, and installs them **only into the JMStudio prefix**: the prefix's symlinks into Proton are replaced by the patched files, the originals are kept as `*.orig`, and `camerafix remove` puts everything back. Proton itself is not touched. No binaries are shipped, only the patches. After a Proton update or prefix upgrade, run `camerafix` again; `doctor` tells you when it is missing.
+`jmstudio-linux camerafix` builds everything from the signed Wine 11.0 release sources (SHA-256 pinned) with `clang`, and installs it **only into the JMStudio prefix**: the prefix's symlinks into Proton are replaced by the patched files (originals kept as `*.orig`), `qcapjm` is added next to them, and `camerafix remove` puts everything back. Proton itself is not touched. No binaries are shipped, only the patches. After a Proton update or prefix upgrade, run `camerafix` again; `doctor` tells you when it is missing.
 
 ## Not verified yet
 
@@ -130,6 +135,8 @@ The Moose's cameras deliver **10 fps**: every mode they advertise (MJPEG 640x480
 2. Try another USB port, ideally USB 3 and without a hub.
 3. `./jmstudio-linux --debug run`, connect the scanner, close the program, then inspect the log: `grep -iE 'devenum|mfplat|err:' "$(./jmstudio-linux logs)" | less`. For more channels: `WINEDEBUG='+timestamp,+devenum,+mfplat,err+all' ./jmstudio-linux --debug run`.
 4. Try another runner: `--proton GE-Proton11-7-x86_64` or `--runner wine` (the camera fix is built against Wine 11.0 and is only tested with Proton Experimental).
+
+**JMStudio hangs at start at 100% CPU, or the Proton log ends in `double free or corruption`** - this is a crash in Proton's own graphics start-up (DXVK/Vulkan), before JMStudio touches a camera. It also happens without the camera fix (2 of 30 starts in a test; 5 of 30 with it, too few runs to tell the difference). Close the hung process (`pkill -x JMStudio.exe`) and start again.
 
 **Installer fails or the program crashes at start** - install the Visual C++ runtime with `./jmstudio-linux winetricks vcrun2022` and try again.
 
