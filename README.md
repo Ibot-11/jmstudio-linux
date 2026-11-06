@@ -100,6 +100,10 @@ The Moose is two UVC cameras behind a USB hub. JMStudio finds it by looking at W
 
 JMStudio's own log, useful for any report, is in `~/.local/share/jmstudio-linux/prefix/pfx/drive_c/users/steamuser/AppData/Roaming/Jimuyida/JMStudio/log/`. A healthy start looks like `Current device is Moose`, `ICT CameraA index:0 ...`, `Connect scanner successfully...`.
 
+## Frame rate
+
+The Moose's cameras deliver **10 fps**: every mode they advertise (MJPEG 640x480, 1280x720, 1280x1024) has a 0.1 s frame interval (`v4l2-ctl -d /dev/video0 --list-formats-ext`). Natively, `v4l2-ctl` measures 10.00 fps per camera, also with both streaming at once, and asking for 15 fps is answered with 10. About 10-11 FPS in JMStudio is therefore the scanner's limit, not Wine's.
+
 ## Troubleshooting
 
 **JMStudio does not see the scanner** (banner "Es besteht keine normale Verbindung", or `Connect scanner failed!` in its log)
